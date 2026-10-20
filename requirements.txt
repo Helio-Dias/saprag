@@ -1,0 +1,5 @@
+simple-term-menu>=1.6.0
+psycopg2-binary>=2.9.0
+google-cloud-firestore>=2.27.0
+google-cloud-aiplatform>=1.149.0
+pymupdf>=1.24.0

@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SAPRAG — User Manual</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --panel-2: #1e222e;
+    --text: #e6e8ee;
+    --muted: #a0a6b4;
+    --accent: #6ea8fe;
+    --accent-2: #7ee0b8;
+    --border: #2a2f3d;
+    --code-bg: #0b0d13;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  .layout { display: flex; max-width: 1200px; margin: 0 auto; }
+  nav {
+    position: sticky;
+    top: 0;
+    align-self: flex-start;
+    width: 240px;
+    height: 100vh;
+    padding: 2rem 1rem;
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+  }
+  nav h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  nav a { display: block; color: var(--text); text-decoration: none; padding: 0.35rem 0.5rem; border-radius: 6px; font-size: 0.92rem; }
+  nav a:hover { background: var(--panel-2); color: var(--accent); }
+  main { flex: 1; padding: 2.5rem 3rem; max-width: 860px; }
+  header.hero {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1.5rem;
+    margin-bottom: 2rem;
+  }
+  header.hero h1 { font-size: 2.4rem; margin: 0 0 0.3rem; letter-spacing: -0.02em; }
+  header.hero p { color: var(--muted); font-size: 1.1rem; margin: 0; }
+  h2 { font-size: 1.6rem; margin-top: 3rem; padding-bottom: 0.4rem; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.2rem; margin-top: 1.8rem; color: var(--accent-2); }
+  p, li { color: var(--text); }
+  code {
+    background: var(--code-bg);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    font-size: 0.88em;
+    color: #ffd9a0;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; color: #d6deeb; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  tr:hover td { background: var(--panel-2); }
+  .callout {
+    background: var(--panel);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    padding: 0.9rem 1.1rem;
+    margin: 1.2rem 0;
+  }
+  .callout.tip { border-left-color: var(--accent-2); }
+  .callout.warn { border-left-color: #e0a06e; }
+  .callout strong { color: var(--accent); }
+  .callout.tip strong { color: var(--accent-2); }
+  .callout.warn strong { color: #e0a06e; }
+  .step { display: flex; gap: 1rem; margin: 1.2rem 0; }
+  .step .num {
+    flex: 0 0 2rem; height: 2rem; line-height: 2rem; text-align: center;
+    background: var(--accent); color: #0b0d13; font-weight: 700; border-radius: 50%;
+  }
+  .step .body { flex: 1; }
+  .step .body h4 { margin: 0.2rem 0 0.4rem; }
+  footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85rem; }
+  .pill { display: inline-block; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; padding: 0.1rem 0.7rem; font-size: 0.78rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav>
+    <h2>Contents</h2>
+    <a href="#overview">Overview</a>
+    <a href="#installation">Installation</a>
+    <a href="#launch">Launching SAPRAG</a>
+    <a href="#ingestion">Document Ingestion</a>
+    <a href="#embeddings">Computing Embeddings</a>
+    <a href="#search">Searching</a>
+    <a href="#cache">Cache Benefits</a>
+    <a href="#evolution">Evolution</a>
+    <a href="#flow">End-to-End Flow</a>
+    <a href="#troubleshooting">Troubleshooting</a>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <h1>SAPRAG User Manual</h1>
+      <p>A document chunking, semantic search, and answer-refinement toolkit.</p>
+    </header>
+
+    <section id="overview">
+      <h2>Overview</h2>
+      <p>
+        SAPRAG is a knowledge pipeline that turns your documents into a searchable,
+        AI-answerable knowledge base. It splits documents into overlapping chunks,
+        computes vector embeddings for them, and answers questions with a
+        multi-query Retrieval-Augmented Generation (RAG) pipeline backed by a local
+        language model.
+      </p>
+      <p>
+        Everything is driven from a single central menu, <code>saprag.py</code>,
+        which dispatches to the individual modules:
+      </p>
+      <table>
+        <thead><tr><th>Menu option</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td>Insert document (interactive chunking)</td><td>Chunk one file and store it in PostgreSQL + Firestore</td></tr>
+          <tr><td>Process new files</td><td>Batch-ingest everything in <code>arquivos_novos/</code> into Firestore</td></tr>
+          <tr><td>Compute embeddings</td><td>Generate vector embeddings for chunks that don't have one yet</td></tr>
+          <tr><td>Search (RAG pipeline)</td><td>Ask a question and get a sourced answer</td></tr>
+          <tr><td>Evolve cached answers</td><td>Re-answer recent questions by reading full documents (no RAG)</td></tr>
+          <tr><td>Migrate PostgreSQL → Firestore</td><td>Copy existing documents/chunks from Postgres into Firestore</td></tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        <strong>Primary store:</strong> GCP Firestore (<code>helio-test-db</code>).
+        PostgreSQL is a secondary/local store used by the interactive chunker and
+        the migration tool.
+      </div>
+    </section>
+
+    <section id="installation">
+      <h2>Installation</h2>
+
+      <h3>1. Python dependencies</h3>
+      <pre><code>pip3 install -r requirements.txt</code></pre>
+      <table>
+        <thead><tr><th>Package</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>simple-term-menu</code></td><td>Interactive terminal menus</td></tr>
+          <tr><td><code>psycopg2-binary</code></td><td>PostgreSQL connection</td></tr>
+          <tr><td><code>google-cloud-firestore</code></td><td>Firestore connection</td></tr>
+          <tr><td><code>google-cloud-aiplatform</code></td><td>Vertex AI embeddings</td></tr>
+          <tr><td><code>pymupdf</code></td><td>Text extraction from PDFs</td></tr>
+          <tr><td><code>claude</code> (Claude Code CLI)</td><td>Reaches Claude Haiku (<code>claude-haiku-4-5</code>) for query decomposition, synthesis, and evolution. Must be installed, authenticated, and on <code>PATH</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>2. Google Cloud authentication</h3>
+      <p>Search and ingestion talk to Firestore and Vertex AI, which require Application Default Credentials:</p>
+      <pre><code>gcloud auth application-default login</code></pre>
+
+      <h3>3. PostgreSQL (optional — local Docker via Colima)</h3>
+      <p>Only needed for the interactive <em>Insert document</em> option and the <em>Migrate</em> option.</p>
+      <pre><code>colima start          # start the runtime
+docker start postgres # start the container</code></pre>
+      <table>
+        <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Host / Port</td><td>localhost : 5432</td></tr>
+          <tr><td>User / Password</td><td>postgres / postgres</td></tr>
+          <tr><td>Database</td><td>postgres</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout warn">
+        <strong>Claude Code CLI required:</strong> search and evolution call Claude
+        Haiku by shelling out to <code>claude -p --model claude-haiku-4-5</code>.
+        Make sure the <code>claude</code> CLI is installed, authenticated, and on
+        your <code>PATH</code>. These actions need network access.
+      </div>
+    </section>
+
+    <section id="launch">
+      <h2>Launching SAPRAG</h2>
+      <p>Start the central menu from the project directory:</p>
+      <pre><code>python3 saprag.py</code></pre>
+      <p>
+        Use the arrow keys to move and <kbd>Enter</kbd> to select. Each action runs,
+        then returns you to the menu. Errors in one action (for example a missing
+        model or a database that's down) are caught and reported without crashing
+        the menu, so you can fix the issue and try again.
+      </p>
+      <div class="callout warn">
+        <strong>Requires a real terminal.</strong> The menu uses
+        <code>simple-term-menu</code>, which needs an interactive TTY. It won't run
+        with piped input.
+      </div>
+    </section>
+
+    <section id="ingestion">
+      <h2>Document Ingestion</h2>
+      <p>There are two ways to get documents into the knowledge base.</p>
+
+      <h3>Option A — Interactive (one file)</h3>
+      <p>Menu: <strong>Insert document (interactive chunking)</strong>. Writes to both PostgreSQL and Firestore.</p>
+      <div class="step"><div class="num">1</div><div class="body"><h4>Choose file</h4>Pick a <code>.txt</code>, <code>.doc</code>, <code>.docx</code>, or <code>.md</code> file from the current directory.</div></div>
+      <div class="step"><div class="num">2</div><div class="body"><h4>Choose description</h4>A short human-readable label for the document.</div></div>
+      <div class="step"><div class="num">3</div><div class="body"><h4>Choose chunk size &amp; overlap</h4>Defaults: <code>528</code> characters per chunk, <code>128</code> characters of overlap. Overlap keeps context from being lost at chunk boundaries.</div></div>
+      <div class="step"><div class="num">4</div><div class="body"><h4>Run chunking</h4>The file is read, split, and inserted as an atomic transaction in PostgreSQL plus a batch write to Firestore.</div></div>
+
+      <h3>Option B — Batch (a folder of files)</h3>
+      <p>Menu: <strong>Process new files</strong>. Processes everything in the <code>arquivos_novos/</code> folder straight into Firestore.</p>
+      <ul>
+        <li>Supported formats: <code>.doc</code>, <code>.docx</code>, <code>.txt</code>, <code>.md</code>, <code>.pdf</code>.</li>
+        <li><code>.doc</code>/<code>.docx</code> Confluence exports are parsed from multipart MIME; HTML is stripped and validated.</li>
+        <li><code>.pdf</code> text is extracted page by page.</li>
+        <li>Deduplicates by file path, so re-running won't create duplicates.</li>
+        <li>The description is auto-generated from the (URL-decoded) file name.</li>
+        <li>An ingestion date (<code>data_onboard</code>) is stored — used later to resolve contradictions by preferring the most recent document.</li>
+      </ul>
+
+      <h3>How chunking works</h3>
+      <ul>
+        <li>Text is split into pieces of <em>chunk size</em> characters with <em>overlap</em> between consecutive chunks.</li>
+        <li>If a cut would land in the middle of a word, it advances to the next whitespace boundary.</li>
+        <li>Chunking is deterministic — the same input always yields the same chunks, which makes a document fully reproducible from its source.</li>
+      </ul>
+    </section>
+
+    <section id="embeddings">
+      <h2>Computing Embeddings</h2>
+      <p>Menu: <strong>Compute embeddings</strong>. Chunks are only searchable once they have a vector embedding.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Model</td><td><code>text-embedding-004</code> (Vertex AI, region <code>europe-west1</code>)</td></tr>
+          <tr><td>Dimensions</td><td>768</td></tr>
+          <tr><td>Batch size</td><td>20 chunks per API call</td></tr>
+          <tr><td>Idempotent</td><td>Skips chunks that already have an embedding</td></tr>
+        </tbody>
+      </table>
+      <div class="callout tip">
+        <strong>Tip:</strong> run this right after ingesting new documents. It only
+        processes chunks that are missing an embedding, so it's safe and cheap to
+        re-run.
+      </div>
+    </section>
+
+    <section id="search">
+      <h2>Searching</h2>
+      <p>Menu: <strong>Search (RAG pipeline)</strong>. Type a question and get an answer grounded in your documents. The answer is always returned in the same language as your question.</p>
+
+      <h3>How the pipeline works</h3>
+      <div class="step"><div class="num">0</div><div class="body"><h4>Cache check</h4>The question is embedded and compared against previously answered questions. A close enough match returns instantly (see <a href="#cache">Cache Benefits</a>).</div></div>
+      <div class="step"><div class="num">1</div><div class="body"><h4>Decomposition</h4>Claude Haiku breaks your question into 2–4 focused sub-queries, each keeping the central context of the original.</div></div>
+      <div class="step"><div class="num">2</div><div class="body"><h4>Multi-query search</h4>All chunks are loaded once; the original query and every sub-query are matched by cosine similarity, then merged and de-duplicated by best score.</div></div>
+      <div class="step"><div class="num">3</div><div class="body"><h4>Round 1 synthesis</h4>The model answers from the retrieved chunks and, if anything is incomplete or truncated, generates follow-up questions.</div></div>
+      <div class="step"><div class="num">4</div><div class="body"><h4>Round 2 (automatic)</h4>If follow-ups exist, a second search gathers new chunks and a final consolidated answer is produced.</div></div>
+
+      <h3>Tuning parameters</h3>
+      <table>
+        <thead><tr><th>Constant</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>TOP_K_PER_QUERY</code></td><td>5</td><td>Chunks returned per sub-query</td></tr>
+          <tr><td><code>TOP_K_MERGED</code></td><td>15</td><td>Max chunks in round 1 after dedup</td></tr>
+          <tr><td><code>TOP_K_SECOND_ROUND</code></td><td>10</td><td>Max new chunks in round 2</td></tr>
+          <tr><td><code>MAX_SUB_QUERIES</code></td><td>4</td><td>Limit of generated sub-queries</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout">
+        <strong>Contradiction resolution:</strong> when chunks disagree, the most
+        recently onboarded document wins. If dates are equal, the majority of
+        chunks is followed.
+      </div>
+    </section>
+
+    <section id="cache">
+      <h2>Cache Benefits</h2>
+      <p>
+        Every completed answer is saved to a result cache along with the question's
+        embedding. Before running the full (and relatively expensive) pipeline,
+        SAPRAG compares a new question to cached ones by cosine similarity and acts
+        on how close the match is.
+      </p>
+      <table>
+        <thead><tr><th>Match level</th><th>Similarity</th><th>Behavior</th></tr></thead>
+        <tbody>
+          <tr><td>Perfect</td><td>&ge; 0.98</td><td>Returns the cached answer directly</td></tr>
+          <tr><td>Near-perfect</td><td>&ge; 0.92</td><td>Returns the cached answer directly</td></tr>
+          <tr><td>Auxiliary</td><td>&ge; 0.85</td><td>Feeds the cached answer in as extra context during synthesis</td></tr>
+          <tr><td>Miss</td><td>&lt; 0.85</td><td>Runs the full pipeline</td></tr>
+        </tbody>
+      </table>
+      <h3>Why it matters</h3>
+      <ul>
+        <li><strong>Speed:</strong> repeated or near-identical questions skip the model entirely and return in a fraction of a second.</li>
+        <li><strong>Cost:</strong> fewer embedding and generation calls.</li>
+        <li><strong>Consistency:</strong> the same question gives the same answer rather than re-deriving it each time.</li>
+        <li><strong>Partial reuse:</strong> even a loose match (auxiliary) helps — the old answer becomes additional context for a fresh synthesis.</li>
+      </ul>
+      <div class="callout tip">
+        <strong>Note:</strong> the cache is a semantic de-duplicator, not a search
+        log. A repeated question updates usage counters on the existing cache entry
+        rather than creating a new record.
+      </div>
+    </section>
+
+    <section id="evolution">
+      <h2>Evolution</h2>
+      <p>Menu: <strong>Evolve cached answers</strong>. Evolution tries to produce answers that are <em>better</em> than what the RAG pipeline already cached.</p>
+      <p>
+        The idea: a RAG answer can lose context because it only sees a handful of
+        generic chunks. Evolution instead reads the <strong>entire documents, whole</strong>,
+        with Claude Haiku — no vector search — to re-answer recent cached
+        questions more completely.
+      </p>
+
+      <h3>Running it</h3>
+      <p>You are asked for two numbers:</p>
+      <table>
+        <thead><tr><th>Prompt</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>Minute budget (total)</td><td>Total time to spend this run</td></tr>
+          <tr><td>Number of cached questions</td><td>The N most recent cached questions to improve</td></tr>
+        </tbody>
+      </table>
+      <p>The budget is split evenly. Example: <code>10</code> minutes over <code>5</code> questions = <strong>2 minutes each</strong> for the 5 most recent cached questions.</p>
+
+      <h3>How it works (map-reduce, no RAG)</h3>
+      <div class="step"><div class="num">1</div><div class="body"><h4>Map</h4>For each stored document, its chunks are joined into full text and the model extracts only what's relevant to the question.</div></div>
+      <div class="step"><div class="num">2</div><div class="body"><h4>Reduce</h4>Once every document has been read, the collected evidence is synthesized into a final answer, explicitly aiming to surpass the cached one while staying grounded in the evidence.</div></div>
+
+      <h3>Key behaviors</h3>
+      <ul>
+        <li><strong>Soft deadline:</strong> the per-question time slice is checked before reading each document. A model call already running is allowed to finish, so wall time can slightly exceed the slice.</li>
+        <li><strong>Resumable:</strong> reading the whole corpus is slow (each map step is a CLI call to Haiku) and rarely finishes in one slice. Progress (next document + evidence so far) is persisted. Re-run with the same count to continue; the final answer is written only after the whole corpus has been read.</li>
+        <li><strong>Model load not charged:</strong> the model is loaded once before the per-question clocks start.</li>
+      </ul>
+
+      <div class="callout warn">
+        <strong>Expect multiple runs.</strong> Each map step is a separate CLI call
+        to Haiku, so a large document set may not be fully read in one short
+        budget. That is exactly why evolution is resumable — just run it
+        again to pick up where it left off.
+      </div>
+    </section>
+
+    <section id="flow">
+      <h2>End-to-End Flow</h2>
+      <p>A typical path from raw files to answers, all from the central menu:</p>
+      <ol>
+        <li>Copy files into <code>arquivos_novos/</code>.</li>
+        <li><strong>Process new files</strong> — chunk and store in Firestore.</li>
+        <li><strong>Compute embeddings</strong> — make the chunks searchable.</li>
+        <li><strong>Search</strong> — ask questions and get sourced answers.</li>
+        <li><strong>Evolve cached answers</strong> (optional) — improve the best answers offline over time.</li>
+      </ol>
+      <p>Equivalent command-line invocation without the menu:</p>
+      <pre><code>python3 process_new_files.py
+python3 embed_chunks.py
+python3 search.py "your question here"</code></pre>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Troubleshooting</h2>
+      <table>
+        <thead><tr><th>Symptom</th><th>Likely cause &amp; fix</th></tr></thead>
+        <tbody>
+          <tr><td>Menu fails with a <code>/dev/tty</code> error</td><td>You're not in a real terminal. Run <code>python3 saprag.py</code> directly in an interactive shell.</td></tr>
+          <tr><td>Firestore / Vertex AI permission errors</td><td>Run <code>gcloud auth application-default login</code>.</td></tr>
+          <tr><td>"Could not connect to the database"</td><td>Start Postgres: <code>colima start &amp;&amp; docker start postgres</code>. Only the Insert/Migrate options need it.</td></tr>
+          <tr><td>Long pause / error on search or evolution</td><td>Ensure the <code>claude</code> CLI is installed, authenticated, and on <code>PATH</code>, and that you have network access.</td></tr>
+          <tr><td>Search returns "not enough information"</td><td>Chunks may be missing embeddings — run <strong>Compute embeddings</strong>.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <footer>
+      <span class="pill">SAPRAG</span>
+      Document chunking &middot; semantic search &middot; answer evolution. Generated manual — see <code>CLAUDE.md</code> for developer details.
+    </footer>
+  </main>
+</div>
+</body>
+</html>

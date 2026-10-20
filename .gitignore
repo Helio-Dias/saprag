@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+*.egg-info/
+
+# Data directories (local documents, not part of the codebase)
+arquivos_novos/
+arquivos_office_it/
+arquivos_velhos/
+
+# OS
+.DS_Store

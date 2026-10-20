@@ -1,0 +1,2236 @@
+GCP MySQL 8 - Temporary Tablespace Issues  Diagnostic & Resolution Playbook
+
+
+
+By Helio Fernandes Vitorio da Fonseca Dias
+
+
+42 min
+
+Listen
+
+2
+
+Add a reaction
+0 Associations
+0 Associations
+Mentions
+Mentions
+Executive Summary
+
+Problem
+
+MySQL 8.x instances can encounter temporary tablespace issues when the InnoDB temporary tablespace (e.g., the ibtmp1 file) grows excessively or fills up. This is usually triggered by heavy query workloads (large sorts, aggregations, joins, etc.) that spill to disk, leading to disk space exhaustion, performance degradation, or even query failures (ERROR 1114 – The table is full). In Cloud SQL, this manifests as rapid growth of "Tmp_data" usage, potentially consuming all available storage. Cloud SQL's auto-storage increase may expand disk size to accommodate growth, but temporary space is not freed until a MySQL restart, leaving the instance with permanently higher storage utilization (and cost) unless addressed.
+Key Root Causes
+
+Almost any operation that cannot be completed in memory may spill to the temp tablespace. Common culprits include complex queries (large JOINs, GROUP BY, ORDER BY, DISTINCT, heavy CTEs/subqueries, window functions, etc.) that create massive internal temporary tables. Unoptimized queries (e.g., missing indexes, selecting excessive rows/columns) often cause MySQL to sort or group using disk-based temp files. InnoDB always uses the ibtmp1 file for on-disk temp tables in MySQL 8, and this file never shrinks during runtime. Concurrent large temp tables or long-running temp operations can accumulate and quickly exhaust disk space. Other factors include insufficient memory (causing more operations to spill to disk), misconfiguration of temp limits, or even InnoDB purge lag (delayed cleanup of undo logs for temp tables) that bloats the temp tablespace. In Cloud SQL, the lack of OS-level access means DBAs must rely on MySQL's instrumentation and Cloud Monitoring to detect these issues.
+Impact
+
+Symptoms range from performance slowdowns (due to heavy disk I/O for temp files) and storage bloat (Cloud SQL auto-increasing disk size due to ibtmp1 growth), to query failures ("table full" errors) or even instance unavailability if disk fills completely. A replica may experience replication lag if a heavy temp-table-using query is replayed serially, and session leaks (connections left open with large CREATE TEMPORARY TABLE data) can hold temp space indefinitely. Because Cloud SQL does not allow shrinking storage, prevention and timely resolution are critical.
+Solution Approach
+
+This playbook provides a step-by-step workflow to diagnose, troubleshoot, and resolve MySQL temp tablespace issues on GCP Cloud SQL. It guides DBAs to quickly identify offending queries (using Performance Schema, Cloud SQL logs, etc.), assess temp space usage (e.g., via INFORMATION_SCHEMA.FILES for innodb_temporary), and take immediate remedial actions (such as killing runaway sessions, enabling emergency storage auto-grow, or restarting if needed). Then it delves into root cause analysis and permanent fixes, optimizing queries (adding indexes, rewriting queries, using optimizer hints), adjusting MySQL configuration parameters (e.g., increasing tmp_table_size if appropriate, tuning buffer sizes), and addressing Cloud SQL-specific constraints (like using flags for config changes, managing read replicas and failovers). The playbook also covers monitoring and alerting setup (Cloud Monitoring metrics, log-based alerts for temp space usage) and preventative best practices to avoid recurrence (query design guidelines, periodic reviews, capacity planning).
+Expected Outcomes
+
+By following this playbook, the team will be able to:
+Diagnose temp space issues in minutes
+Pinpoint the root-cause query within 30 minutes
+Apply safe immediate mitigations (e.g., kill or throttle the offending workload) within 10 minutes
+Implement long-term optimizations within a day
+The goal is not only to resolve the current incident but to establish ongoing monitoring and safeguards so that MySQL temp space issues are caught early or prevented entirely.
+Contents
+
+Root Cause Analysis – All Potential Causes
+Identifying Problematic Queries (Deep Dive)
+Step-by-Step Troubleshooting Workflow
+Immediate Remediation Actions
+Permanent Fixes and Optimizations
+GCP Cloud SQL Specific Considerations
+Monitoring and Alerting Strategy
+Prevention and Long-Term Solutions
+Root Cause Analysis – Understanding Temporary Tablespace Issues {#root-cause-analysis}
+
+Temporary tablespace problems in MySQL 8 are almost always symptoms of underlying query or configuration issues. This section explores all potential root causes of temp tablespace growth or errors, ensuring no stone is left unturned.
+1. Heavy Queries Creating Large Temporary Tables
+
+MySQL creates implicit temporary tables for certain SQL operations. If these result sets are large, they can consume significant space:
+Sorting and Grouping Operations
+
+Queries with expensive ORDER BY, GROUP BY, or DISTINCT clauses often use a temp table to sort or deduplicate results. The execution proceeds in two phases: MySQL first gathers results into a temp table, then sorts or groups them. Large datasets here mean a large temp table on disk.
+Joins and Unindexed Searches
+
+Joining large tables without proper indexes (or SELECTs with broad LIKE '%...%' filters) can prevent efficient indexed lookup. MySQL may resort to scanning and storing intermediate results in a temp table (especially for hash joins or if using block nested loop with a large buffer). Unoptimized joins thus contribute to temp usage.
+UNIONs, Derived Tables, and CTEs
+
+UNION (especially UNION DISTINCT) combines results via a temp table unless certain conditions allow streaming. Derived tables (subqueries in the FROM clause) and Common Table Expressions (WITH) are often materialized into temp tables for the optimizer to treat as tables. MySQL 8 sometimes can optimize away materialization, but complex CTEs usually materialize, consuming temp space.
+Large Aggregations
+
+Computing aggregates (SUM, COUNT(DISTINCT ...), etc.) on large unindexed columns may create temp tables. Functions like GROUP_CONCAT() and COUNT(DISTINCT) explicitly use temp tables if memory is insufficient.
+Window Functions
+
+MySQL 8 window functions (e.g., ranking functions) often need to buffer partitions of data. The optimizer will use temp tables as needed for windowing steps. Large window function result sets = large temp usage.
+Multiple-table UPDATE/DELETE
+
+Complex updates joining tables or subqueries may create internal temp tables for intermediate results (e.g., for the SELECT part of an UPDATE ... JOIN).
+INSERT … SELECT on same table
+
+In MySQL, inserting into a table from a subquery on the same table uses a temp table to store the select output before insertion.
+Why this causes issues: If these operations produce more data than fits in memory, MySQL will spill to disk (the temp tablespace). For example, any result needing sorting that doesn't fit in the sort_buffer_size will be written to a temp file on disk (filesort algorithm). Similarly, huge intermediate results (hundreds of MB or more) will exceed the in-memory temp table threshold and convert to on-disk tables. On Cloud SQL, all such disk spills ultimately write to the ibtmp1 file (since MySQL 8 uses InnoDB for disk temp storage), causing ibtmp1 to balloon.
+Supporting facts: MySQL's manual confirms a temp table is needed for many of the above situations. If the temp table is small it stays in memory, but beyond a threshold it goes to disk. The default limit for in-memory temp tables is 16 MB (controlled by tmp_table_size and max_heap_table_size). Queries involving TEXT/BLOB columns automatically use disk-based temps, no matter how small, due to engine limitations.
+2. Disk Space Exhaustion & ibtmp1 Growth Patterns
+
+The InnoDB temporary tablespace (ibtmp1) is a single file (or set of files) on disk used for all on-disk temp tables. Key characteristics that can lead to problems:
+No Auto-Shrink
+
+The ibtmp1 file grows as needed but does not shrink until MySQL restarts. Even after temp tables are dropped and space is internally freed for reuse, the file remains at its high-water mark size. This means repeated large temp usages can ratchet up the file size over time.
+Reuse vs. Release
+
+Although space within ibtmp1 can be reused by new temp tables (so the server won't infinite-loop allocate space once the file is large), it won't release space back to the OS. If free disk is low, this can eventually lead to "disk full" errors even if no single query is using that entire space at once.
+Autoextend & Cloud SQL Auto-Resize
+
+By default, ibtmp1 is autoextending (e.g., starts at 12MB and grows). On Cloud SQL, if automatic storage increase is enabled, the underlying disk will expand when usage approaches capacity. A burst of temp space usage can trigger multiple auto-resizes, permanently increasing your allocated storage (since Cloud SQL cannot shrink disks). If auto-resize is off or hits its limit, the instance will error out (data disk is full in logs).
+Write I/O Overhead
+
+As ibtmp1 grows, writing/reading those large temp tables imposes heavy disk I/O. If the storage is not very fast or if the instance hits IOPS limits, overall query throughput suffers. This can manifest as slow queries or high I/O wait on the instance.
+Example scenario: Consider a workload with periodic heavy analytical queries. The first time a 5 GB temp table is created, ibtmp1 grows to ~5 GB. If later another query needs 8 GB, ibtmp1 grows to 8 GB. Even after those queries finish, ibtmp1 stays at 8 GB. If multiple concurrent queries each use ~8 GB, the file may grow to ~(8 GB × number of concurrent queries) before reuse kicks in, because each session's temp table is separate. It's easy to see how disk can be exhausted by a burst of temp activity.
+Cloud SQL implications: Because you cannot manually shrink ibtmp1 on Cloud SQL (no OS access, and MySQL has no shrink command), the only way to reset ibtmp1 is to restart the instance. This frees the space internally and if autogrow had occurred, leaves you with a lot of free space on disk (but you're still paying for that storage unless you contact support to reduce it). Frequent uncontrolled growth indicates you should identify the offending query patterns and either limit them or plan for enough disk headroom.
+3. Runaway Temporary Tables & Memory Spillover
+
+"Runaway" temporary table usage refers to scenarios where temp space grows uncontrollably due to one or more sessions:
+Implicit Temp Table Spillover
+
+MySQL tries to use memory for temp tables first (using the TempTable engine by default in 8.0). If an internal temp table exceeds tmp_table_size (and max_heap_table_size for user memory tables), it is converted to an on-disk temp table. Similarly, if the total memory used by temp tables across threads exceeds certain limits (temptable_max_ram, etc.), MySQL may start writing to disk. In MySQL 8, by default temptable_max_ram is 1 GB or 3% of server memory (whichever is larger, capped at 4 GB). If this is exceeded (and memory-mapped files are disabled by default), MySQL will use disk (InnoDB temp files) for new temp table allocations. A workload that triggers this (lots of concurrent temp table usage or one huge operation) can suddenly cause a flood of disk temp data.
+Sort Buffer and Join Buffer Exhaustion
+
+MySQL uses per-session memory buffers for sort and join operations (sort_buffer_size, join_buffer_size). If data to sort exceeds sort_buffer_size, MySQL performs a disk-based merge sort (creating temp files for sorted runs) – effectively another kind of temp file usage. Similarly, insufficient join buffer can force MySQL to repeatedly scan/join in pieces, possibly writing temp state to disk. Enlarging these buffers can reduce disk I/O per query, but be cautious: they are allocated per thread, so setting them too large can exhaust RAM if many threads do sorting/joining concurrently.
+Unbounded Intermediate Results
+
+A poorly constrained query (e.g., missing a WHERE clause or an extremely large DISTINCT) can create a temp table of enormous size unintentionally. If such a query runs for a long time, it might fill up the temp space (especially if multiple such queries run). Example: a SELECT DISTINCT on a column of a 100-million-row table without an index will force sorting all 100 million values. If each value is, say, 100 bytes, that's ~10 GB of data that might go into a temp table on disk.
+Symptoms: During such "runaway" events, you may see MySQL processlist entries in states like "Copying to tmp table" or "Copying to tmp table on disk" for extended durations. The Cloud SQL monitoring would show tmp_data climbing continuously. Eventually, errors like "The table '#sqlXXX' is full" or "No space left on device" may appear when queries cannot allocate more temp space.
+4. Configuration Issues and Mis-tuned Parameters
+
+Several MySQL configuration variables directly control temp table behavior. Misconfiguration or default settings not suited for your workload can contribute to problems:
+tmp_table_size and max_heap_table_size
+
+These define the max size of an in-memory temp table (the lesser of the two applies per temp table). If set too low (default ~16MB), even moderately sized intermediate results will spill to disk. If set too high relative to available RAM and workload, you risk memory exhaustion if many large temp tables stay in RAM concurrently. The balance must be based on workload – e.g., OLAP queries might benefit from a higher limit to avoid disk I/O, whereas OLTP with many concurrent small temp tables might keep defaults.
+internal_tmp_mem_storage_engine
+
+In MySQL 8, the default is TempTable (a new engine optimized for varchars, supports large blobs in memory up to limits). The alternative is MEMORY (the old engine, which pads VARCHARs and doesn't allow large BLOB/TEXT). Sticking with TempTable is generally best for performance, but there have been bugs (e.g., early MySQL 8 versions had issues that made switching to MEMORY a temporary workaround). In Cloud SQL 8.x, you would rarely change this – only consider if you suspect a specific bug with TempTable engine.
+temptable_max_ram / temptable_max_mmap
+
+These global limits cap memory usage of the TempTable engine. By default, temptable_max_ram is 1 GB (minimum) and temptable_max_mmap=0 (meaning MySQL will not use memory-mapped temp files by default). If you have plenty of RAM, increasing temptable_max_ram can allow more/larger temp tables to stay in memory (reducing disk usage). Enabling memory-mapped files (by setting a nonzero temptable_max_mmap) could let MySQL use temp files that are deleted on close (thus not persisting like ibtmp1), but note that Cloud SQL's tmpdir is on a non-accessible path; plus, the default is disabled to avoid uncontrolled use of file system space.
+innodb_temp_data_file_path
+
+This defines initial size and autoextend settings for ibtmp1. In Cloud SQL, you cannot easily change this (and it likely uses the default "ibtmp1:12M:autoextend"). In regular MySQL, one might set a maximum size (max: size) to prevent infinite growth, but this simply causes queries to error out once the cap is hit. On Cloud SQL, setting such a cap is not advisable, better to rely on monitoring and auto-resize to avoid a crash, then fix the underlying issue.
+performance_schema and sys schema settings
+
+Although not a direct cause of temp usage, Performance Schema collects a lot of data in memory and can itself be resource-intensive if fully enabled. Some performance_schema queries (especially those joining large history tables) might create temp tables to produce reports. If you've increased Performance Schema instrumentation (e.g., statement history size), that could indirectly create larger temp tables when querying the data. By default, though, the overhead is modest.
+Cloud SQL constraints: Configuration changes on Cloud SQL are done via flags in the UI or gcloud command (no my.cnf to edit). Some flags (like tmp_table_size) can be set dynamically, others might require a restart (the Cloud SQL docs or interface will indicate if a flag change needs reboot). Also, Cloud SQL might restrict certain flags for compatibility – always verify the flag is allowed.
+5. Performance Schema Instrumentation Overhead
+
+This is a less common cause, but worth noting for completeness: if Performance Schema and the MySQL sys schema (which provides handy views) are heavily used, they could contribute to temp usage:
+Many of the sys schema views (like sys.statements_with_temp_tables) run queries on Performance Schema tables, aggregating data. Those aggregation queries themselves might create internal temp tables (especially if the Performance Schema summary tables contain many rows due to a high number of normalized query patterns).
+If you enable full query digest collection and have thousands of different query patterns, the Performance Schema summary tables (e.g., events_statements_summary_by_digest) could grow large (hundreds or thousands of rows). Selecting from them with ordering could use a temp table for sorting results.
+However, this is typically not a primary driver of persistent temp tablespace growth because these tables are memory-resident and any temp table used to format a result is short-lived.
+In summary, the Performance Schema is unlikely to fill your disk, but if you are aggressively querying it during heavy load, it could be a small piece of the puzzle. Ensure Performance Schema is configured appropriately (perhaps limit history sizes, etc.) so it doesn't become an additional burden during an incident.
+6. Connection/Session Leaks Holding Temp Resources
+
+MySQL user-created temporary tables (created with CREATE TEMPORARY TABLE) exist per session and are dropped automatically when the session ends. If an application opens a temp table and either forgets to drop it or the session remains open (idle or leaked in a connection pool), that temp table's data remains in the temp tablespace:
+Long-lived temp tables
+
+For example, if a user session created a temp table and inserted 1 GB of data into it, ibtmp1 will have grown (since by default a user temp table will use InnoDB and thus ibtmp1 for its data and undo logs). If the session is left open (perhaps an app connection that didn't close), that 1 GB stays allocated. Even if the table is not actively used, MySQL cannot reclaim that space until the table is dropped or the session ends.
+Abandoned sessions
+
+In Cloud SQL, if your connection pool does not properly close connections, or an interactive session (e.g., a MySQL client shell) is left running with a temp table open, you have a "leak." MySQL's wait_timeout might eventually close truly idle sessions, but many frameworks execute periodic keep-alive queries to keep connections open. Check that wait_timeout on Cloud SQL is reasonable (the default might be 10 minutes, but some Cloud SQL setups use higher timeouts).
+Open transactions holding undo
+
+Slightly different angle, if a session had a long-running open transaction that involved changes to a temporary table (or even a normal table), the undo for those changes can't be purged until commit. For user temp tables, those undo logs reside in ibtmp1 as well. A "stuck" transaction could thus bloat temp space with pending undo. This is rare but possible (e.g., a transaction that created a temp table, did large inserts/deletes, and never committed/rolled back because the app hung).
+Detection: Use SHOW PROCESSLIST or Performance Schema (events_statements_current, etc.) to see if there are threads with some "Opening tables" or just sleeping but user is known to create temp tables. You can also query INFORMATION_SCHEMA.INNODB_TEMP_TABLE_INFO, it lists user-created temp tables that currently exist (with the session ID that owns them). If that table is huge, that's a smoking gun. In Cloud SQL, this table should be accessible; it will show the table name (which is something like #sql..., unless the app named it explicitly) and creation time.
+Resolution: Identify the session (by Id or user/host from INNODB_TEMP_TABLE_INFO or processlist) and terminate it if it's not needed. Killing the session will drop all its temp tables and free the space (though ibtmp1 won't shrink, it will just mark it free internally). In the long term, fix the application logic to ensure temp tables are dropped and connections are not leaked (consider lowering wait_timeout or using connection pooler settings to aggressively recycle idle connections).
+7. Replication and Temp Tables (Lag/Failover Considerations)
+
+If you use Cloud SQL read replicas or external replicas, replication can surface unique issues with temp tables:
+Statement-based replication and temp tables
+
+If the primary uses statement-based binlog format (rare in Cloud SQL, which defaults to ROW format), temp tables can cause inconsistencies. Statements involving temp tables do not replicate well – e.g., a CREATE TEMPORARY TABLE ... SELECT ... on primary will execute fine, but the replica may not have the same temp table context if it restarts, etc. Thankfully, Cloud SQL uses row-based replication by default, avoiding this pitfall.
+Row-based replication lag due to heavy queries
+
+Even with row-based replication, if the primary runs a huge query that creates a massive temp table, the replica has to perform the same work (the actual data inserted into the temp table might be written via row events, or the entire operation might be contained in a transaction to apply). If that query was slow on primary, it could be slow on replica too, causing replica lag.
+Failover impact
+
+In a High Availability configuration (Primary-Replica), if a temp-space issue on primary causes a failover (e.g., primary restarts due to error or you manually fail over to relieve pressure), the new primary (which was the replica) might not have the same temp tables. However, since temp tables are session-bound, on failover those are lost. This generally clears the problem (since a restart is involved), but any in-flight transactions that used temp tables are aborted. After failover, ibtmp1 on the new primary will be empty (fresh process), which is good – but ensure the root cause (query) doesn't just run again and trigger the same issue.
+Mitigation:
+Offload heavy queries to replicas or analytics servers when possible
+If using multiple parallel workers (slave_parallel_workers), be aware that frequent use of temp tables in transactions can limit parallelism
+Ensure the replica has autoresize on as well, so it can handle temp growth
+Test failover scenarios if you rely on them for clearing issues
+8. InnoDB Temporary Tablespace Mechanism (MySQL 8 Specifics)
+
+Since this playbook focuses on MySQL 8, it's important to note how MySQL 8's temp tablespace works compared to older versions:
+Engine = InnoDB only
+
+Location
+
+By default ibtmp1 resides in the data directory. You can configure innodb_temp_data_file_path to place it elsewhere (relative to datadir). Cloud SQL does not allow changing datadir or using custom paths, so essentially ibtmp1 lives on the same disk as your data. This means heavy temp usage contends with regular data for disk bandwidth and space.
+Reset on restart
+
+On clean shutdown, MySQL will remove ibtmp1. On startup it recreates a fresh 12MB file. This is why restart is a "solution" to reclaim space – it starts fresh (but again, Cloud SQL disk size won't shrink automatically).
+Temporary table undo logs
+
+In MySQL 8, undo logs for changes to user-created temporary tables are stored in ibtmp1 (since they're not durable and shouldn't pollute the main undo logs). If a workload does large updates on temp tables within a transaction, that can generate lots of undo in ibtmp1. Normally purge will remove it once transaction commits, but if purge is lagging behind, ibtmp1 might keep growing. This is part of the earlier "purge lag" cause – essentially, check if Innodb_history_list_length (length of undo log list) is huge and not coming down; that could hint that purge isn't keeping up, possibly due to large temp table churn.
+By understanding all these causes, we can better target our troubleshooting. Next, we focus on detecting the specific queries and processes that are driving temp space usage.
+Identifying Problematic Queries (Critical Focus)
+
+
+
+The single most important task in resolving temp tablespace issues is finding which queries or operations are consuming the space. This section provides an in-depth guide to detecting high temp-space queries and analyzing them for optimization.
+Detecting High Temp Table Usage Queries
+
+MySQL 8 provides performance metrics that make it easier to find offending queries:
+1. Performance Schema (Statement Digests)
+
+The events_statements_summary_by_digest table aggregates statistics per normalized query pattern. It has counters for how many temp tables each query generated:
+SUM_CREATED_TMP_TABLES – total temp tables (memory + disk) created by that query across all executions
+SUM_CREATED_TMP_DISK_TABLES – how many of those were disk-based temp tables
+Script 1: Top 10 Query Patterns by Disk Temp Tables
+
+
+
+SELECT 
+    DIGEST_TEXT AS query_pattern,
+    COUNT_STAR AS exec_count,
+    SUM_CREATED_TMP_TABLES AS total_temp_tables,
+    SUM_CREATED_TMP_DISK_TABLES AS disk_temp_tables,
+    ROUND(SUM_CREATED_TMP_DISK_TABLES / NULLIF(SUM_CREATED_TMP_TABLES, 0) * 100, 1) AS pct_temp_on_disk,
+    ROUND(AVG_TIMER_WAIT / 1000000000000, 2) AS avg_exec_time_sec,
+    ROUND(SUM_SORT_ROWS / COUNT_STAR, 0) AS avg_rows_sorted
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_CREATED_TMP_TABLES > 0
+ORDER BY SUM_CREATED_TMP_DISK_TABLES DESC
+LIMIT 10;
+This will show queries that often spill to disk. A high pct_temp_on_disk (near 100%) means the query's temp results rarely fit in memory.
+Script 2: Queries with High Temp Table Usage per Execution
+
+
+
+SELECT 
+    DIGEST_TEXT AS query_pattern,
+    COUNT_STAR AS exec_count,
+    ROUND(SUM_CREATED_TMP_DISK_TABLES / COUNT_STAR, 2) AS avg_disk_temps_per_exec,
+    ROUND(SUM_CREATED_TMP_TABLES / COUNT_STAR, 2) AS avg_total_temps_per_exec,
+    ROUND(AVG_TIMER_WAIT / 1000000000000, 2) AS avg_exec_time_sec,
+    FIRST_SEEN,
+    LAST_SEEN
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_CREATED_TMP_TABLES > 0
+  AND COUNT_STAR > 0
+ORDER BY avg_disk_temps_per_exec DESC
+LIMIT 10;
+This identifies queries that consistently create many disk temp tables per execution, even if not run frequently.
+2. sys.statements_with_temp_tables View
+
+Cloud SQL includes the MySQL "sys" schema by default, which has convenient views on Performance Schema.
+Script 3: Using sys Schema for Temp Table Analysis
+
+
+
+SELECT 
+    query,
+    db,
+    exec_count,
+    total_latency,
+    memory_tmp_tables,
+    disk_tmp_tables,
+    ROUND((disk_tmp_tables / NULLIF(memory_tmp_tables, 0)) * 100, 1) AS pct_disk,
+    avg_tmp_tables_per_exec,
+    tmp_tables_to_disk_pct,
+    first_seen,
+    last_seen
+FROM sys.statements_with_temp_tables 
+WHERE disk_tmp_tables > 0
+ORDER BY disk_tmp_tables DESC 
+LIMIT 15;
+3. Current Running Queries (Processlist)
+
+If the temp space issue is happening right now, inspect active queries.
+Script 4: Find Currently Executing Queries Using Temp Tables
+
+
+
+SELECT 
+    p.ID,
+    p.USER,
+    p.HOST,
+    p.DB,
+    p.COMMAND,
+    p.TIME AS duration_sec,
+    p.STATE,
+    LEFT(p.INFO, 200) AS query_snippet,
+    CONCAT(t.PROCESSLIST_USER, '@', t.PROCESSLIST_HOST) AS full_user,
+    t.THREAD_ID,
+    s.SQL_TEXT
+FROM INFORMATION_SCHEMA.PROCESSLIST p
+JOIN performance_schema.threads t ON t.PROCESSLIST_ID = p.ID
+LEFT JOIN performance_schema.events_statements_current s ON s.THREAD_ID = t.THREAD_ID
+WHERE p.STATE LIKE '%tmp table%' 
+   OR p.STATE LIKE '%Sorting%'
+   OR p.STATE LIKE '%filesort%'
+   OR p.STATE LIKE '%Creating sort index%'
+ORDER BY p.TIME DESC;
+Script 5: Long-Running Queries (Potential Temp Table Culprits)
+
+
+
+SELECT 
+    ID,
+    USER,
+    HOST,
+    DB,
+    COMMAND,
+    TIME AS duration_sec,
+    STATE,
+    LEFT(INFO, 300) AS query_text
+FROM INFORMATION_SCHEMA.PROCESSLIST
+WHERE COMMAND != 'Sleep'
+  AND TIME > 30  -- Running for more than 30 seconds
+ORDER BY TIME DESC
+LIMIT 20;
+4. Temp Table Usage by Session
+
+Script 6: Identify Which Sessions Are Creating Most Temp Tables
+
+
+
+SELECT 
+    t.THREAD_ID,
+    t.PROCESSLIST_ID,
+    t.PROCESSLIST_USER,
+    t.PROCESSLIST_HOST,
+    t.PROCESSLIST_DB,
+    t.PROCESSLIST_STATE,
+    COUNT(esh.EVENT_ID) AS statement_count,
+    SUM(esh.CREATED_TMP_TABLES) AS total_tmp_tables,
+    SUM(esh.CREATED_TMP_DISK_TABLES) AS total_disk_tmp_tables,
+    ROUND(SUM(esh.CREATED_TMP_DISK_TABLES) / NULLIF(SUM(esh.CREATED_TMP_TABLES), 0) * 100, 1) AS pct_disk
+FROM performance_schema.threads t
+LEFT JOIN performance_schema.events_statements_history esh ON esh.THREAD_ID = t.THREAD_ID
+WHERE t.PROCESSLIST_ID IS NOT NULL
+GROUP BY t.THREAD_ID
+HAVING total_tmp_tables > 0
+ORDER BY total_disk_tmp_tables DESC
+LIMIT 20;
+5. User-Created Temporary Tables (Session Leaks)
+
+Script 7: Find All Active User-Created Temporary Tables
+
+
+
+SELECT 
+    temp.NAME AS table_name,
+    temp.SPACE AS tablespace_id,
+    temp.PER_TABLE_TABLESPACE,
+    temp.ROW_FORMAT,
+    t.THREAD_ID,
+    t.PROCESSLIST_ID,
+    t.PROCESSLIST_USER,
+    t.PROCESSLIST_HOST,
+    t.PROCESSLIST_DB,
+    t.PROCESSLIST_TIME AS session_duration_sec,
+    t.PROCESSLIST_STATE,
+    t.PROCESSLIST_INFO
+FROM INFORMATION_SCHEMA.INNODB_TEMP_TABLE_INFO temp
+JOIN performance_schema.threads t ON t.THREAD_ID = temp.SPACE  -- Note: mapping may vary
+ORDER BY temp.SPACE;
+Note: The exact mapping between INNODB_TEMP_TABLE_INFO and session info may require joining on appropriate columns based on your MySQL version.
+6. Slow Query Log Analysis
+
+If the slow query log is enabled (recommended during troubleshooting):
+Script 8: Enable Slow Query Log with Temp Table Tracking
+
+
+
+-- Enable slow query logging
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 2;  -- Log queries taking > 2 seconds
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+SET GLOBAL log_output = 'FILE';  -- or 'TABLE' to query from mysql.slow_log
+-- To output to Cloud Logging instead:
+-- Use Cloud SQL flags: log_output=FILE, slow_query_log=ON
+Cloud SQL allows enabling slow query log and outputting to Cloud Logging. Look for entries where Tmp_disk_tables is high.
+7. Memory Usage by TempTable Engine
+
+Script 9: Check TempTable Engine Memory Usage
+
+
+
+SELECT 
+    EVENT_NAME,
+    CURRENT_COUNT_USED AS objects_in_use,
+    CURRENT_NUMBER_OF_BYTES_USED / 1024 / 1024 AS current_mb,
+    HIGH_COUNT_USED AS high_objects,
+    HIGH_NUMBER_OF_BYTES_USED / 1024 / 1024 AS high_watermark_mb,
+    LOW_COUNT_USED,
+    LOW_NUMBER_OF_BYTES_USED / 1024 / 1024 AS low_mb
+FROM performance_schema.memory_summary_global_by_event_name 
+WHERE EVENT_NAME LIKE 'memory/temptable/%'
+ORDER BY CURRENT_NUMBER_OF_BYTES_USED DESC;
+This shows how much memory the TempTable engine is currently using and its high-water mark.
+Analyzing and Optimizing the Culprit Queries
+
+After identifying problematic query patterns, perform a deep analysis:
+EXPLAIN the Query
+
+Script 10: Comprehensive EXPLAIN Analysis
+
+
+
+-- Run EXPLAIN in JSON format for detailed analysis
+EXPLAIN FORMAT=JSON
+SELECT ...your query here...;
+-- Or use traditional format
+EXPLAIN 
+SELECT ...your query here...;
+-- For MySQL 8.0.18+, use EXPLAIN ANALYZE for actual execution stats
+EXPLAIN ANALYZE
+SELECT ...your query here...;
+Look for these indicators in EXPLAIN output:
+"Using temporary" in Extra column indicates temp table usage
+"Using filesort" indicates disk-based sorting
+"type: ALL" indicates full table scan (often requires temp tables)
+High "rows" estimates suggest large intermediate result sets
+Analyze Sort and Join Operations
+
+Script 11: Check Sort and Join Statistics
+
+
+
+SHOW GLOBAL STATUS LIKE 'Sort%';
+SHOW GLOBAL STATUS LIKE 'Select%';
+-- Detailed breakdown
+SELECT 
+    VARIABLE_NAME,
+    VARIABLE_VALUE,
+    CASE 
+        WHEN VARIABLE_NAME = 'Sort_merge_passes' AND VARIABLE_VALUE > 0 
+            THEN 'High merge passes indicate insufficient sort_buffer_size'
+        WHEN VARIABLE_NAME = 'Sort_range' 
+            THEN 'Sorts done with range access'
+        WHEN VARIABLE_NAME = 'Sort_rows' 
+            THEN 'Total rows sorted'
+        WHEN VARIABLE_NAME = 'Sort_scan' 
+            THEN 'Sorts done with full table scan'
+        ELSE ''
+    END AS interpretation
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME LIKE 'Sort%'
+ORDER BY VARIABLE_NAME;
+Check for Possible Missing Indexes
+
+Script 12: Find Large Tables With Few Indexes
+
+
+
+SELECT 
+    t.TABLE_SCHEMA,
+    t.TABLE_NAME,
+    t.TABLE_ROWS,
+    ROUND(((t.DATA_LENGTH + t.INDEX_LENGTH) / 1024 / 1024), 2) AS total_size_mb,
+    ROUND((t.DATA_LENGTH / 1024 / 1024), 2) AS data_size_mb,
+    ROUND((t.INDEX_LENGTH / 1024 / 1024), 2) AS index_size_mb,
+    COUNT(DISTINCT s.INDEX_NAME) AS index_count
+FROM INFORMATION_SCHEMA.TABLES t
+LEFT JOIN INFORMATION_SCHEMA.STATISTICS s 
+    ON t.TABLE_SCHEMA = s.TABLE_SCHEMA 
+    AND t.TABLE_NAME = s.TABLE_NAME
+WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+  AND t.TABLE_TYPE = 'BASE TABLE'
+GROUP BY t.TABLE_SCHEMA, t.TABLE_NAME
+HAVING index_count < 3  -- Tables with fewer than 3 indexes
+   OR (data_size_mb > 100 AND index_count < 5)  -- Large tables with few indexes
+ORDER BY t.TABLE_ROWS DESC
+LIMIT 25;
+Script 13: Identify Unused Indexes (Candidates for Removal)
+
+
+
+SELECT 
+    s.TABLE_SCHEMA,
+    s.TABLE_NAME,
+    s.INDEX_NAME,
+    s.CARDINALITY,
+    tio.COUNT_STAR AS index_usages,
+    tio.COUNT_READ,
+    tio.COUNT_WRITE,
+    tio.COUNT_FETCH,
+    tio.COUNT_INSERT,
+    tio.COUNT_UPDATE,
+    tio.COUNT_DELETE
+FROM INFORMATION_SCHEMA.STATISTICS s
+LEFT JOIN performance_schema.table_io_waits_summary_by_index_usage tio
+    ON s.TABLE_SCHEMA = tio.OBJECT_SCHEMA
+    AND s.TABLE_NAME = tio.OBJECT_NAME
+    AND s.INDEX_NAME = tio.INDEX_NAME
+WHERE s.TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+  AND s.INDEX_NAME != 'PRIMARY'
+  AND (tio.COUNT_STAR IS NULL OR tio.COUNT_STAR = 0)
+ORDER BY s.TABLE_SCHEMA, s.TABLE_NAME, s.INDEX_NAME;
+Analyze Query Complexity
+
+Script 14: Find Queries with Complex Execution Plans
+
+
+
+SELECT 
+    DIGEST_TEXT,
+    COUNT_STAR AS executions,
+    ROUND(AVG_TIMER_WAIT / 1000000000000, 2) AS avg_time_sec,
+    SUM_ROWS_EXAMINED / COUNT_STAR AS avg_rows_examined,
+    SUM_ROWS_SENT / COUNT_STAR AS avg_rows_sent,
+    SUM_CREATED_TMP_TABLES / COUNT_STAR AS avg_tmp_tables,
+    SUM_CREATED_TMP_DISK_TABLES / COUNT_STAR AS avg_disk_tmp_tables,
+    SUM_SORT_ROWS / COUNT_STAR AS avg_rows_sorted,
+    ROUND((SUM_ROWS_EXAMINED / NULLIF(SUM_ROWS_SENT, 0)), 2) AS exam_to_sent_ratio,
+    FIRST_SEEN,
+    LAST_SEEN
+FROM performance_schema.events_statements_summary_by_digest
+WHERE COUNT_STAR > 0
+  AND SUM_CREATED_TMP_TABLES > 0
+HAVING avg_rows_examined > 10000  -- High row examination
+   OR exam_to_sent_ratio > 100    -- Poor selectivity
+   OR avg_disk_tmp_tables > 0     -- Using disk temps
+ORDER BY avg_disk_tmp_tables DESC, avg_rows_examined DESC
+LIMIT 20;
+Example Optimizations
+
+Example 1: SELECT DISTINCT with ORDER BY
+
+Problem Query:
+
+
+
+SELECT DISTINCT customer_id 
+FROM orders 
+ORDER BY order_date DESC;
+Issues:
+MySQL collects all 50M orders
+Sorts by date
+Then removes duplicates
+Creates huge temp table
+Optimized Solution:
+
+
+
+SELECT customer_id, MAX(order_date) AS last_order_date 
+FROM orders 
+GROUP BY customer_id 
+ORDER BY last_order_date DESC;
+Required Index:
+
+
+
+CREATE INDEX idx_customer_orderdate ON orders(customer_id, order_date);
+Example 2: JOIN without Index and Large GROUP BY
+
+Problem Query:
+
+
+
+SELECT u.country, COUNT(l.log_id) AS log_count
+FROM users u
+JOIN logs l ON u.user_id = l.user_id
+GROUP BY u.country;
+Issues:
+No index on logs.user_id
+No index on users.country
+Full table scan and massive temp table
+Solution:
+
+
+
+-- Add necessary indexes
+CREATE INDEX idx_logs_userid ON logs(user_id);
+CREATE INDEX idx_users_country ON users(country);
+-- Alternative: Pre-aggregate approach
+SELECT u.country, SUM(log_counts.cnt) AS log_count
+FROM users u
+JOIN (
+    SELECT user_id, COUNT(*) AS cnt
+    FROM logs
+    GROUP BY user_id
+) AS log_counts ON u.user_id = log_counts.user_id
+GROUP BY u.country;
+Example 3: Large CTE Materialization
+
+Problem Query:
+
+
+
+WITH large_cte AS (
+    SELECT complex_calculation(...)
+    FROM huge_table
+    WHERE date_range = last_year  -- Returns 5M rows
+)
+SELECT *
+FROM large_cte
+JOIN other_table ON ...
+WHERE specific_condition = 'X';  -- Filters down to 1000 rows
+Solution:
+
+
+
+-- Push filter into CTE or use derived table instead
+SELECT *
+FROM (
+    SELECT complex_calculation(...)
+    FROM huge_table
+    WHERE date_range = last_year
+      AND some_column IN (
+          SELECT related_column 
+          FROM other_table 
+          WHERE specific_condition = 'X'
+      )
+) AS derived
+JOIN other_table ON ...;
+-- Or use temporary table with index
+CREATE TEMPORARY TABLE temp_results (
+    INDEX idx_join_col (join_column)
+) AS
+SELECT complex_calculation(...)
+FROM huge_table
+WHERE date_range = last_year
+  AND specific_condition = 'X';
+SELECT * FROM temp_results JOIN other_table ON ...;
+DROP TEMPORARY TABLE temp_results;
+Advanced Query Optimization Scripts
+
+Script 15: Generate Index Recommendations
+
+
+
+-- This script identifies columns frequently used in WHERE/JOIN that lack indexes
+SELECT 
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    COLUMN_NAME,
+    COUNT(*) AS usage_count,
+    'Consider adding index' AS recommendation
+FROM (
+    -- This is a simplified example; actual implementation would parse query text
+    SELECT 
+        d.OBJECT_SCHEMA AS TABLE_SCHEMA,
+        d.OBJECT_NAME AS TABLE_NAME,
+        'UNKNOWN' AS COLUMN_NAME  -- Would need query parsing
+    FROM performance_schema.events_statements_summary_by_digest esd
+    JOIN performance_schema.table_io_waits_summary_by_table d
+        ON esd.DIGEST_TEXT LIKE CONCAT('%', d.OBJECT_NAME, '%')
+    WHERE esd.SUM_CREATED_TMP_DISK_TABLES > 0
+      AND d.OBJECT_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+) AS potential_indexes
+GROUP BY TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
+ORDER BY usage_count DESC;
+Script 16: Identify Queries Benefiting from Covering Indexes
+
+
+
+SELECT 
+    DIGEST_TEXT,
+    COUNT_STAR,
+    SUM_ROWS_EXAMINED,
+    SUM_ROWS_SENT,
+    ROUND((SUM_ROWS_EXAMINED - SUM_ROWS_SENT) / NULLIF(SUM_ROWS_EXAMINED, 0) * 100, 1) AS pct_waste,
+    SUM_CREATED_TMP_DISK_TABLES,
+    ROUND(AVG_TIMER_WAIT / 1000000000000, 2) AS avg_sec
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_ROWS_EXAMINED > SUM_ROWS_SENT * 2  -- Examining 2x more rows than returned
+  AND COUNT_STAR > 100
+ORDER BY pct_waste DESC, SUM_ROWS_EXAMINED DESC
+LIMIT 20;
+Script 17: Detect Cartesian Joins (Missing JOIN Conditions)
+
+
+
+SELECT 
+    DIGEST_TEXT,
+    COUNT_STAR AS executions,
+    SUM_ROWS_EXAMINED / COUNT_STAR AS avg_rows_examined,
+    SUM_ROWS_SENT / COUNT_STAR AS avg_rows_sent,
+    CASE 
+        WHEN (SUM_ROWS_EXAMINED / COUNT_STAR) > 1000000 
+            AND DIGEST_TEXT LIKE '%JOIN%'
+            AND DIGEST_TEXT NOT LIKE '%WHERE%'
+        THEN 'Possible Cartesian join - missing JOIN condition'
+        ELSE 'Review for optimization'
+    END AS warning
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_ROWS_EXAMINED / COUNT_STAR > 100000
+  AND DIGEST_TEXT LIKE '%JOIN%'
+ORDER BY avg_rows_examined DESC
+LIMIT 15;
+Step-by-Step Troubleshooting Workflow
+
+When facing a temp tablespace issue, follow this structured, phased approach to ensure all aspects are checked.
+Phase 1: Initial Assessment 
+
+Gather quick diagnostics to understand the scope and impact.
+Step 1: Check Temp Space Usage
+
+Script 18: Complete Temporary Tablespace Assessment
+
+
+
+-- Check ibtmp1 file size and usage
+SELECT 
+    TABLESPACE_NAME,
+    FILE_NAME,
+    FILE_TYPE,
+    ENGINE,
+    ROUND(TOTAL_EXTENTS * @@innodb_page_size / 1024 / 1024, 2) AS total_mb,
+    ROUND(( TOTAL_EXTENTS - FREE_EXTENTS) * @@innodb_page_size / 1024 / 1024, 2) AS used_mb,
+    ROUND(FREE_EXTENTS * @@innodb_page_size / 1024 / 1024, 2) AS free_mb,
+    ROUND(((TOTAL_EXTENTS - FREE_EXTENTS) / TOTAL_EXTENTS * 100), 2) AS pct_used,
+    EXTENT_SIZE,
+    AUTOEXTEND_SIZE,
+    STATUS
+FROM INFORMATION_SCHEMA.FILES 
+WHERE TABLESPACE_NAME = 'innodb_temporary'\G
+-- Get global temp table statistics
+SELECT 
+    VARIABLE_NAME,
+    VARIABLE_VALUE,
+    CASE VARIABLE_NAME
+        WHEN 'Created_tmp_tables' THEN 'Total temp tables created since startup'
+        WHEN 'Created_tmp_disk_tables' THEN 'Temp tables that used disk'
+        WHEN 'Created_tmp_files' THEN 'Temporary files created'
+    END AS description
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME IN (
+    'Created_tmp_tables',
+    'Created_tmp_disk_tables', 
+    'Created_tmp_files'
+);
+-- Calculate temp table disk usage percentage
+SELECT 
+    ROUND((
+        (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Created_tmp_disk_tables') /
+        NULLIF((SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Created_tmp_tables'), 0)
+    ) * 100, 2) AS pct_disk_temp_tables;
+Script 19: Check Disk Space and Data Directory
+
+
+
+-- Show data directory location
+SELECT @@datadir AS data_directory;
+-- Show temp-related configuration
+SELECT 
+    VARIABLE_NAME,
+    VARIABLE_VALUE
+FROM performance_schema.global_variables
+WHERE VARIABLE_NAME IN (
+    'tmpdir',
+    'innodb_temp_data_file_path',
+    'tmp_table_size',
+    'max_heap_table_size',
+    'internal_tmp_mem_storage_engine',
+    'temptable_max_ram',
+    'temptable_max_mmap',
+    'sort_buffer_size',
+    'join_buffer_size'
+)
+ORDER BY VARIABLE_NAME;
+Step 2: Identify Active Problem Sessions
+
+Script 20: Comprehensive Active Session Analysis
+
+
+
+SELECT 
+    p.ID,
+    p.USER,
+    p.HOST,
+    p.DB,
+    p.COMMAND,
+    p.TIME AS duration_sec,
+    p.STATE,
+    SUBSTRING(p.INFO, 1, 100) AS query_snippet,
+    t.THREAD_ID,
+    t.PROCESSLIST_STATE,
+    esc.SQL_TEXT AS current_statement,
+    esc.CREATED_TMP_TABLES,
+    esc.CREATED_TMP_DISK_TABLES,
+    esc.SORT_ROWS,
+    esc.SORT_MERGE_PASSES,
+    ROUND(esc.TIMER_WAIT / 1000000000000, 2) AS elapsed_sec,
+    trx.trx_id,
+    trx.trx_state,
+    trx.trx_started,
+    TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()) AS trx_duration_sec,
+    trx.trx_rows_locked,
+    trx.trx_rows_modified
+FROM INFORMATION_SCHEMA.PROCESSLIST p
+LEFT JOIN performance_schema.threads t ON t.PROCESSLIST_ID = p.ID
+LEFT JOIN performance_schema.events_statements_current esc ON esc.THREAD_ID = t.THREAD_ID
+LEFT JOIN INFORMATION_SCHEMA.INNODB_TRX trx ON trx.trx_mysql_thread_id = p.ID
+WHERE p.COMMAND != 'Sleep'
+  AND (
+    p.STATE LIKE '%tmp table%'
+    OR p.STATE LIKE '%Sorting%'
+    OR p.STATE LIKE '%filesort%'
+    OR p.STATE LIKE '%Creating sort index%'
+    OR p.TIME > 60
+    OR esc.CREATED_TMP_DISK_TABLES > 0
+  )
+ORDER BY p.TIME DESC, esc.CREATED_TMP_DISK_TABLES DESC;
+Step 3: Review Recent Growth Patterns
+
+Script 21: Temp Table Creation Rate Monitor
+
+
+
+-- Baseline measurement
+SELECT 
+    NOW() AS measurement_time,
+    VARIABLE_VALUE AS created_tmp_tables,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+     WHERE VARIABLE_NAME = 'Created_tmp_disk_tables') AS created_disk_tmp_tables
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Created_tmp_tables';
+-- Wait 60 seconds, then run again to see the rate
+-- Or use this stored procedure for continuous monitoring:
+Script 22: Historical Temp Usage Pattern (if enabled)
+
+
+
+-- This requires Performance Schema history to be enabled
+SELECT 
+    DATE_FORMAT(FROM_UNIXTIME(LAST_SEEN/1000000000000), '%Y-%m-%d %H:00:00') AS hour_bucket,
+    SUM(COUNT_STAR) AS query_executions,
+    SUM(SUM_CREATED_TMP_TABLES) AS total_tmp_tables,
+    SUM(SUM_CREATED_TMP_DISK_TABLES) AS total_disk_tmp_tables,
+    ROUND(SUM(SUM_CREATED_TMP_DISK_TABLES) / NULLIF(SUM(SUM_CREATED_TMP_TABLES), 0) * 100, 1) AS pct_disk,
+    COUNT(DISTINCT DIGEST) AS unique_query_patterns
+FROM performance_schema.events_statements_summary_by_digest
+WHERE LAST_SEEN > UNIX_TIMESTAMP(DATE_SUB(NOW(), INTERVAL 24 HOUR)) * 1000000000000
+  AND SUM_CREATED_TMP_TABLES > 0
+GROUP BY hour_bucket
+ORDER BY hour_bucket DESC;
+Phase 2: Identify the Culprit(s) (10-30 minutes)
+
+Find the specific query or process responsible and gather evidence.
+Step 4: Pinpoint Heavy Queries
+
+Script 23: Complete Query Attribution Analysis
+
+
+
+-- Comprehensive view of problematic queries
+SELECT 
+    SCHEMA_NAME,
+    DIGEST_TEXT,
+    COUNT_STAR AS executions,
+    SUM_CREATED_TMP_TABLES AS total_tmp,
+    SUM_CREATED_TMP_DISK_TABLES AS total_disk_tmp,
+    ROUND(SUM_CREATED_TMP_DISK_TABLES / COUNT_STAR, 2) AS avg_disk_tmp_per_exec,
+    ROUND(SUM_CREATED_TMP_DISK_TABLES / NULLIF(SUM_CREATED_TMP_TABLES, 0) * 100, 1) AS pct_disk,
+    ROUND(AVG_TIMER_WAIT / 1000000000000, 2) AS avg_exec_sec,
+    ROUND(SUM_TIMER_WAIT / 1000000000000, 2) AS total_exec_sec,
+    ROUND(SUM_ROWS_EXAMINED / COUNT_STAR, 0) AS avg_rows_examined,
+    ROUND(SUM_ROWS_SENT / COUNT_STAR, 0) AS avg_rows_sent,
+    ROUND(SUM_SORT_ROWS / COUNT_STAR, 0) AS avg_rows_sorted,
+    SUM_SORT_MERGE_PASSES,
+    SUM_NO_INDEX_USED,
+    SUM_NO_GOOD_INDEX_USED,
+    FROM_UNIXTIME(FIRST_SEEN/1000000000000) AS first_seen_time,
+    FROM_UNIXTIME(LAST_SEEN/1000000000000) AS last_seen_time
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_CREATED_TMP_TABLES > 0
+ORDER BY total_disk_tmp DESC, avg_disk_tmp_per_exec DESC
+LIMIT 25;
+Script 24: Time-Based Culprit Identification
+
+
+
+-- Find queries that ran during the problem window
+-- Adjust the time window as needed
+SELECT 
+    FROM_UNIXTIME(LAST_SEEN/1000000000000) AS last_execution,
+    SCHEMA_NAME,
+    LEFT(DIGEST_TEXT, 150) AS query_pattern,
+    COUNT_STAR AS recent_executions,
+    SUM_CREATED_TMP_DISK_TABLES AS disk_temps_created,
+    ROUND(AVG_TIMER_WAIT / 1000000000000, 2) AS avg_duration_sec,
+    SUM_ROWS_EXAMINED AS rows_examined
+FROM performance_schema.events_statements_summary_by_digest
+WHERE LAST_SEEN > UNIX_TIMESTAMP(DATE_SUB(NOW(), INTERVAL 2 HOUR)) * 1000000000000
+  AND SUM_CREATED_TMP_DISK_TABLES > 0
+ORDER BY LAST_SEEN DESC, disk_temps_created DESC
+LIMIT 30;
+Step 5: Cross-Reference with Application Logs
+
+GCloud Command: Search Cloud Logging
+
+
+
+# Search for slow query logs
+gcloud logging read "resource.type=cloudsql_database 
+AND resource.labels.database_id=YOUR_INSTANCE_ID
+AND textPayload=~\"Tmp_disk_tables\"
+AND timestamp>=\"2024-01-01T00:00:00Z\"" \
+--limit 50 \
+--format json
+# Search for error messages related to temp tables
+gcloud logging read "resource.type=cloudsql_database 
+AND resource.labels.database_id=YOUR_INSTANCE_ID
+AND (textPayload=~\"table.*full\" OR textPayload=~\"disk.*full\" OR textPayload=~\"temporary\")
+AND severity>=ERROR" \
+--limit 100 \
+--format json
+# Export logs for analysis
+gcloud logging read "resource.type=cloudsql_database 
+AND resource.labels.database_id=YOUR_INSTANCE_ID
+AND timestamp>=\"2024-01-01T00:00:00Z\"" \
+--format json > cloudsql_logs.json
+Phase 3: Immediate Remediation (Immediate - 10 minutes)
+
+Mitigate the issue now to stabilize the system.
+Step 6: Terminate Problematic Sessions
+
+Script 25: Kill Query Safety Check
+
+
+
+-- First, identify the session details
+SELECT 
+    p.ID,
+    p.USER,
+    p.HOST,
+    p.DB,
+    p.TIME AS duration_sec,
+    p.STATE,
+    CONCAT('KILL ', p.ID, ';') AS kill_command,
+    LEFT(p.INFO, 200) AS query_snippet,
+    trx.trx_state,
+    trx.trx_started,
+    trx.trx_rows_locked,
+    trx.trx_rows_modified,
+    CASE 
+        WHEN trx.trx_rows_modified > 0 THEN 'WARNING: Transaction has modified rows'
+        WHEN trx.trx_rows_locked > 1000 THEN 'WARNING: Transaction holds many locks'
+        WHEN p.COMMAND = 'Query' AND p.TIME < 5 THEN 'CAUTION: Query just started'
+        ELSE 'Safe to kill'
+    END AS safety_assessment
+FROM INFORMATION_SCHEMA.PROCESSLIST p
+LEFT JOIN INFORMATION_SCHEMA.INNODB_TRX trx ON trx.trx_mysql_thread_id = p.ID
+WHERE p.ID = <SESSION_ID_TO_KILL>;
+-- If safe, execute:
+-- KILL <SESSION_ID>;
+Script 26: Bulk Kill Problem Sessions (Emergency)
+
+
+
+-- Generate kill commands for all long-running temp-using queries
+SELECT 
+    CONCAT('KILL ', ID, ';') AS kill_command,
+    ID,
+    USER,
+    HOST,
+    TIME,
+    STATE,
+    LEFT(INFO, 100) AS query
+FROM INFORMATION_SCHEMA.PROCESSLIST
+WHERE STATE LIKE '%tmp table%'
+  AND TIME > 300  -- Running for more than 5 minutes
+  AND USER NOT IN ('system user', 'event_scheduler', 'root')
+ORDER BY TIME DESC;
+-- Review the output, then execute each KILL command manually
+-- Or save to a file and execute:
+-- mysql -h <host> -u <user> -p < kill_commands.sql
+Step 7: Emergency Storage Expansion
+
+GCloud Commands: Increase Storage
+
+
+
+# Check current storage configuration
+gcloud sql instances describe YOUR_INSTANCE_NAME \
+  --format="value(settings.dataDiskSizeGb,settings.storageAutoResize,settings.storageAutoResizeLimit)"
+# Enable auto-resize if not already enabled
+gcloud sql instances patch YOUR_INSTANCE_NAME \
+  --storage-auto-resize \
+  --storage-auto-resize-limit=1000
+# Manually increase storage immediately
+gcloud sql instances patch YOUR_INSTANCE_NAME \
+  --storage-size=NEW_SIZE_GB
+# Example: Increase from 100GB to 200GB
+gcloud sql instances patch YOUR_INSTANCE_NAME \
+  --storage-size=200
+# Check operation status
+gcloud sql operations list \
+  --instance=YOUR_INSTANCE_NAME \
+  --limit=5
+Step 8: Apply Temporary Query Throttling
+
+Script 27: Set Query Execution Time Limits
+
+
+
+-- Set global execution time limit (milliseconds)
+-- This will auto-kill queries exceeding the limit
+SET GLOBAL max_execution_time = 300000;  -- 5 minutes
+-- Set for current session only
+SET SESSION max_execution_time = 60000;  -- 1 minute
+-- Reduce concurrent connections temporarily
+SET GLOBAL max_connections = 50;  -- Adjust based on normal load
+-- Check current connection count
+SELECT 
+    COUNT(*) AS current_connections,
+    @@max_connections AS max_allowed,
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.PROCESSLIST WHERE COMMAND != 'Sleep') AS active_connections
+FROM INFORMATION_SCHEMA.PROCESSLIST;
+Phase 4: Root Cause Resolution
+
+Implement permanent fixes so the issue does not recur.
+Step 9: Index Optimization
+
+Script 28: Create Missing Indexes (Template)
+
+
+
+-- Template for adding indexes based on analysis
+-- Example 1: Index for ORDER BY clause
+CREATE INDEX idx_tablename_ordercolumn 
+ON table_name(order_column);
+-- Example 2: Composite index for JOIN and WHERE
+CREATE INDEX idx_tablename_join_filter 
+ON table_name(join_column, filter_column);
+-- Example 3: Covering index (includes all SELECT columns)
+CREATE INDEX idx_tablename_covering 
+ON table_name(where_col, join_col, select_col1, select_col2);
+-- Monitor index creation progress (for large tables)
+SHOW PROCESSLIST;
+-- Check index statistics after creation
+ANALYZE TABLE table_name;
+-- Verify index is being used
+EXPLAIN SELECT ... FROM table_name WHERE ...;
+Script 29: Index Usage Validation
+
+
+
+-- After adding indexes, verify they're being used
+SELECT 
+    OBJECT_SCHEMA AS db,
+    OBJECT_NAME AS table_name,
+    INDEX_NAME,
+    COUNT_STAR AS usage_count,
+    COUNT_READ,
+    COUNT_WRITE,
+    COUNT_FETCH,
+    COUNT_INSERT,
+    COUNT_UPDATE,
+    COUNT_DELETE,
+    SUM_TIMER_WAIT / 1000000000000 AS total_wait_sec
+FROM performance_schema.table_io_waits_summary_by_index_usage
+WHERE OBJECT_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+  AND INDEX_NAME IS NOT NULL
+ORDER BY COUNT_STAR DESC
+LIMIT 50;
+Step 10: MySQL Configuration Tuning
+
+Script 30: Calculate Optimal tmp_table_size
+
+
+
+-- Analyze current temp table sizes to determine optimal setting
+SELECT 
+    ROUND(AVG(SUM_CREATED_TMP_DISK_TABLES / NULLIF(COUNT_STAR, 0)), 2) AS avg_disk_temps_per_query,
+    ROUND(MAX(SUM_CREATED_TMP_DISK_TABLES / NULLIF(COUNT_STAR, 0)), 2) AS max_disk_temps_per_query,
+    COUNT(*) AS query_patterns_using_temps,
+    -- Recommendation: If many small queries spill to disk, increase tmp_table_size
+    CASE 
+        WHEN ROUND(AVG(SUM_CREATED_TMP_DISK_TABLES / NULLIF(COUNT_STAR, 0)), 2) > 0.5
+        THEN 'RECOMMENDATION: Increase tmp_table_size to 64MB or 128MB'
+        ELSE 'Current tmp_table_size appears adequate'
+    END AS recommendation
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_CREATED_TMP_TABLES > 0;
+-- Check current memory-related settings
+SELECT 
+    @@tmp_table_size / 1024 / 1024 AS tmp_table_size_mb,
+    @@max_heap_table_size / 1024 / 1024 AS max_heap_table_size_mb,
+    @@temptable_max_ram / 1024 / 1024 AS temptable_max_ram_mb,
+    @@temptable_max_mmap / 1024 / 1024 AS temptable_max_mmap_mb,
+    @@sort_buffer_size / 1024 / 1024 AS sort_buffer_size_mb,
+    @@join_buffer_size / 1024 / 1024 AS join_buffer_size_mb,
+    @@max_connections,
+    -- Calculate potential memory usage
+    (@@tmp_table_size * @@max_connections) / 1024 / 1024 / 1024 AS potential_tmp_memory_gb
+;
+GCloud Commands: Update MySQL Flags
+
+
+
+# Set tmp_table_size and max_heap_table_size to 64MB
+gcloud sql instances patch YOUR_INSTANCE_NAME \
+  --database-flags=tmp_table_size=67108864,max_heap_table_size=67108864
+# Increase temptable_max_ram to 2GB
+gcloud sql instances patch YOUR_INSTANCE_NAME \
+  --database-flags=temptable_max_ram=2147483648
+# Update sort and join buffers
+gcloud sql instances patch YOUR_INSTANCE_NAME \
+  --database-flags=sort_buffer_size=2097152,join_buffer_size=2097152
+# Enable slow query log for monitoring
+gcloud sql instances patch YOUR_INSTANCE_NAME \
+  --database-flags=slow_query_log=on,long_query_time=2,log_queries_not_using_indexes=on,log_output=FILE
+# Set multiple flags at once
+gcloud sql instances patch YOUR_INSTANCE_NAME \
+  --database-flags="\
+tmp_table_size=67108864,\
+max_heap_table_size=67108864,\
+temptable_max_ram=2147483648,\
+sort_buffer_size=2097152,\
+join_buffer_size=2097152,\
+slow_query_log=on,\
+long_query_time=2"
+# Note: Some flags require instance restart
+# Check if restart is needed:
+gcloud sql instances describe YOUR_INSTANCE_NAME \
+  --format="value(settings.databaseFlags)"
+Script 31: Safe Configuration Change Validator
+
+
+
+-- Before changing configuration, validate current load
+SELECT 
+    'Current Configuration' AS category,
+    @@max_connections AS max_connections,
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.PROCESSLIST) AS current_connections,
+    ROUND((SELECT COUNT(*) FROM INFORMATION_SCHEMA.PROCESSLIST) / @@max_connections * 100, 1) AS connection_usage_pct,
+    @@tmp_table_size / 1024 / 1024 AS tmp_table_size_mb,
+    @@max_heap_table_size / 1024 / 1024 AS max_heap_table_size_mb,
+    -- Estimate memory impact of proposed changes
+    (64 * @@max_connections) / 1024 AS estimated_tmp_memory_gb_at_64mb
+UNION ALL
+SELECT 
+    'Memory Available',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    (SELECT VARIABLE_VALUE / 1024 / 1024 / 1024 
+     FROM performance_schema.global_status 
+     WHERE VARIABLE_NAME = 'Innodb_buffer_pool_size') AS innodb_buffer_pool_gb
+;
+Phase 5: Testing and Validation
+
+Script 32: Before/After Comparison
+
+
+
+-- Run this before and after optimization to compare
+SELECT 
+    'CURRENT_STATE' AS measurement,
+    NOW() AS timestamp,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+     WHERE VARIABLE_NAME = 'Created_tmp_tables') AS tmp_tables_total,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+     WHERE VARIABLE_NAME = 'Created_tmp_disk_tables') AS tmp_disk_tables_total,
+    ROUND((
+        SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+        WHERE VARIABLE_NAME = 'Created_tmp_disk_tables'
+    ) / NULLIF((
+        SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+        WHERE VARIABLE_NAME = 'Created_tmp_tables'
+    ), 0) * 100, 2) AS pct_disk_temps,
+    (SELECT COUNT(*) FROM performance_schema.events_statements_summary_by_digest 
+     WHERE SUM_CREATED_TMP_DISK_TABLES > 0) AS query_patterns_using_disk_temps,
+    (SELECT ROUND(AVG(AVG_TIMER_WAIT / 1000000000000), 2) 
+     FROM performance_schema.events_statements_summary_by_digest 
+     WHERE SUM_CREATED_TMP_DISK_TABLES > 0) AS avg_query_time_sec
+;
+Immediate Remediation Actions {#immediate-remediation}
+
+This section provides detailed emergency response procedures with supporting scripts.
+Emergency Action 1: Session Termination
+
+Script 33: Intelligent Session Kill Decision Matrix
+
+
+
+CREATE TEMPORARY TABLE kill_candidates AS
+SELECT 
+    p.ID,
+    p.USER,
+    p.HOST,
+    p.DB,
+    p.COMMAND,
+    p.TIME AS duration_sec,
+    p.STATE,
+    LEFT(p.INFO, 200) AS query_snippet,
+    COALESCE(trx.trx_rows_modified, 0) AS rows_modified,
+    COALESCE(trx.trx_rows_locked, 0) AS rows_locked,
+    CASE 
+        WHEN p.STATE LIKE '%tmp table%' AND p.TIME > 600 THEN 10  -- High priority
+        WHEN p.STATE LIKE '%Sorting%' AND p.TIME > 300 THEN 9
+        WHEN p.TIME > 1800 THEN 8
+        WHEN esc.CREATED_TMP_DISK_TABLES > 5 THEN 7
+        WHEN trx.trx_rows_locked > 10000 THEN 6
+        ELSE 5
+    END AS kill_priority,
+    CASE 
+        WHEN trx.trx_rows_modified > 0 THEN 'CAUTION: Has modified data'
+        WHEN trx.trx_rows_locked > 1000 THEN 'CAUTION: Holds many locks'
+        WHEN p.USER = 'replication_user' THEN 'CRITICAL: Do not kill replication'
+        WHEN p.COMMAND = 'Binlog Dump' THEN 'CRITICAL: Do not kill binlog thread'
+        ELSE 'Safe to kill'
+    END AS risk_assessment,
+    CONCAT('KILL ', p.ID, ';') AS kill_command
+FROM INFORMATION_SCHEMA.PROCESSLIST p
+LEFT JOIN INFORMATION_SCHEMA.INNODB_TRX trx ON trx.trx_mysql_thread_id = p.ID
+LEFT JOIN performance_schema.events_statements_current esc 
+    ON esc.THREAD_ID = (SELECT THREAD_ID FROM performance_schema.threads WHERE PROCESSLIST_ID = p.ID)
+WHERE p.COMMAND != 'Sleep'
+  AND p.USER NOT IN ('event_scheduler', 'system user')
+  AND (
+    p.STATE LIKE '%tmp table%'
+    OR p.STATE LIKE '%Sorting%'
+    OR p.TIME > 300
+    OR esc.CREATED_TMP_DISK_TABLES > 0
+  )
+ORDER BY kill_priority DESC, duration_sec DESC;
+-- Review the candidates
+SELECT * FROM kill_candidates;
+-- Execute kills for high-priority, safe candidates
+SELECT kill_command 
+FROM kill_candidates 
+WHERE kill_priority >= 8 
+  AND risk_assessment = 'Safe to kill';
+DROP TEMPORARY TABLE kill_candidates;
+Emergency Action 2: Storage Management
+
+Script 34: Emergency Storage Status
+
+
+
+-- Comprehensive storage assessment
+SELECT 
+    'Temp Tablespace' AS component,
+    ROUND((TOTAL_EXTENTS - FREE_EXTENTS) * @@innodb_page_size / 1024 / 1024, 2) AS used_mb,
+    ROUND(TOTAL_EXTENTS * @@innodb_page_size / 1024 / 1024, 2) AS total_mb,
+    ROUND(FREE_EXTENTS * @@innodb_page_size / 1024 / 1024, 2) AS free_mb,
+    ROUND(((TOTAL_EXTENTS - FREE_EXTENTS) / TOTAL_EXTENTS * 100), 2) AS pct_used
+FROM INFORMATION_SCHEMA.FILES 
+WHERE TABLESPACE_NAME = 'innodb_temporary'
+UNION ALL
+SELECT 
+    'InnoDB System',
+    ROUND(SUM(TOTAL_EXTENTS - FREE_EXTENTS) * @@innodb_page_size / 1024 / 1024, 2),
+    ROUND(SUM(TOTAL_EXTENTS) * @@innodb_page_size / 1024 / 1024, 2),
+    ROUND(SUM(FREE_EXTENTS) * @@innodb_page_size / 1024 / 1024, 2),
+    ROUND((SUM(TOTAL_EXTENTS - FREE_EXTENTS) / SUM(TOTAL_EXTENTS) * 100), 2)
+FROM INFORMATION_SCHEMA.FILES 
+WHERE TABLESPACE_NAME = 'innodb_system'
+UNION ALL
+SELECT 
+    'Total Data Size',
+    ROUND(SUM(DATA_LENGTH) / 1024 / 1024, 2),
+    ROUND(SUM(DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2),
+    ROUND(SUM(DATA_FREE) / 1024 / 1024, 2),
+    NULL
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');
+Emergency Storage Commands
+
+
+
+# Check current storage metrics
+gcloud monitoring time-series list \
+  --filter='metric.type="cloudsql.googleapis.com/database/disk/bytes_used"
+  AND resource.labels.database_id="YOUR_INSTANCE_ID"' \
+  --format=json \
+  --limit=10
+# Get storage quota and usage
+gcloud sql instances describe YOUR_INSTANCE_NAME \
+  --format="table(
+    settings.dataDiskSizeGb,
+    settings.dataDiskType,
+    settings.storageAutoResize,
+    settings.storageAutoResizeLimit
+  )"
+# Emergency storage increase (immediate)
+gcloud sql instances patch YOUR_INSTANCE_NAME \
+  --storage-size=NEW_SIZE_GB \
+  --async  # Don't wait for completion
+# Monitor the operation
+gcloud sql operations list \
+  --instance=YOUR_INSTANCE_NAME \
+  --filter="status=RUNNING OR status=PENDING"
+Emergency Action 3: Read-Only Mode (Last Resort)
+
+Script 35: Enable Safe Read-Only Mode
+
+
+
+-- Before enabling read-only, document current state
+CREATE TEMPORARY TABLE pre_readonly_state AS
+SELECT 
+    'Read-Only Activation' AS event_type,
+    NOW() AS timestamp,
+    @@read_only AS was_read_only,
+    @@super_read_only AS was_super_read_only,
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.PROCESSLIST WHERE COMMAND != 'Sleep') AS active_sessions,
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TRX) AS open_transactions;
+-- Check what will be affected
+SELECT 
+    USER,
+    HOST,
+    COUNT(*) AS connection_count,
+    SUM(CASE WHEN COMMAND != 'Sleep' THEN 1 ELSE 0 END) AS active_queries
+FROM INFORMATION_SCHEMA.PROCESSLIST
+WHERE USER NOT IN ('system user', 'event_scheduler', 'root')
+GROUP BY USER, HOST;
+-- Enable read-only mode (users can still read, but no writes)
+SET GLOBAL read_only = ON;
+SET GLOBAL super_read_only = ON;  -- Also blocks SUPER users except replication
+-- Verify
+SELECT @@read_only, @@super_read_only;
+-- Monitor impact
+SELECT 
+    COUNT(*) AS remaining_active,
+    SUM(CASE WHEN STATE LIKE '%Waiting for%' THEN 1 ELSE 0 END) AS waiting_on_lock
+FROM INFORMATION_SCHEMA.PROCESSLIST
+WHERE COMMAND != 'Sleep';
+-- To disable later:
+-- SET GLOBAL super_read_only = OFF;
+-- SET GLOBAL read_only = OFF;
+Permanent Fixes and Optimizations {#permanent-fixes}
+
+Query Rewrite Patterns
+
+Script 36: Query Rewrite Template Generator
+
+
+
+-- Analyze a specific query for optimization opportunities
+-- Replace 'YOUR_QUERY_DIGEST' with actual digest from earlier analysis
+SELECT 
+    DIGEST_TEXT AS original_query,
+    COUNT_STAR AS executions,
+    SUM_CREATED_TMP_DISK_TABLES AS disk_temps,
+    SUM_SORT_ROWS AS total_rows_sorted,
+    SUM_NO_INDEX_USED AS times_no_index,
+    SUM_NO_GOOD_INDEX_USED AS times_no_good_index,
+    CASE 
+        WHEN DIGEST_TEXT LIKE '%DISTINCT%' AND DIGEST_TEXT LIKE '%ORDER BY%'
+            THEN 'REWRITE: Replace DISTINCT with GROUP BY and add index'
+        WHEN DIGEST_TEXT LIKE '%UNION%' AND DIGEST_TEXT NOT LIKE '%UNION ALL%'
+            THEN 'REWRITE: Consider UNION ALL if duplicates are acceptable'
+        WHEN SUM_NO_INDEX_USED > 0
+            THEN 'REWRITE: Add indexes for WHERE/JOIN clauses'
+        WHEN DIGEST_TEXT LIKE '%ORDER BY%' AND SUM_SORT_ROWS > 100000
+            THEN 'REWRITE: Add index on ORDER BY columns'
+        WHEN DIGEST_TEXT LIKE '%GROUP BY%' AND SUM_CREATED_TMP_DISK_TABLES > 0
+            THEN 'REWRITE: Add composite index on GROUP BY columns'
+        ELSE 'Review execution plan with EXPLAIN'
+    END AS optimization_suggestion
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST = 'YOUR_QUERY_DIGEST';
+Script 37: Subquery to JOIN Conversion Helper
+
+
+
+-- Find queries with subqueries that might benefit from JOIN conversion
+SELECT 
+    LEFT(DIGEST_TEXT, 200) AS query_pattern,
+    COUNT_STAR AS executions,
+    ROUND(AVG_TIMER_WAIT / 1000000000000, 2) AS avg_duration_sec,
+    SUM_CREATED_TMP_DISK_TABLES AS disk_temps,
+    'Consider converting subquery to JOIN with proper indexes' AS suggestion
+FROM performance_schema.events_statements_summary_by_digest
+WHERE (
+    DIGEST_TEXT LIKE '%WHERE%IN%(SELECT%'
+    OR DIGEST_TEXT LIKE '%WHERE%EXISTS%(SELECT%'
+    OR DIGEST_TEXT LIKE '%WHERE%=%(%SELECT%'
+  )
+  AND AVG_TIMER_WAIT > 1000000000000  -- > 1 second
+ORDER BY AVG_TIMER_WAIT DESC
+LIMIT 20;
+Automated Index Recommendations
+
+Script 38: Generate Index Recommendations Based on Query Patterns
+
+
+
+-- This script generates index recommendations based on actual query patterns
+-- Note: This is a simplified heuristic; verify each recommendation
+WITH query_analysis AS (
+    SELECT 
+        DIGEST,
+        DIGEST_TEXT,
+        SCHEMA_NAME,
+        SUM_CREATED_TMP_DISK_TABLES,
+        SUM_NO_INDEX_USED,
+        SUM_NO_GOOD_INDEX_USED,
+        COUNT_STAR,
+        -- Extract table names (simplified pattern matching)
+        SUBSTRING_INDEX(SUBSTRING_INDEX(DIGEST_TEXT, 'FROM ', -1), ' ', 1) AS potential_table
+    FROM performance_schema.events_statements_summary_by_digest
+    WHERE SUM_CREATED_TMP_DISK_TABLES > 0
+       OR SUM_NO_INDEX_USED > 0
+),
+table_stats AS (
+    SELECT 
+        TABLE_SCHEMA,
+        TABLE_NAME,
+        TABLE_ROWS,
+        ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS size_mb,
+        COUNT(DISTINCT COLUMN_NAME) AS column_count
+    FROM INFORMATION_SCHEMA.TABLES t
+    LEFT JOIN INFORMATION_SCHEMA.COLUMNS c USING (TABLE_SCHEMA, TABLE_NAME)
+    WHERE TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+    GROUP BY TABLE_SCHEMA, TABLE_NAME
+)
+SELECT 
+    qa.SCHEMA_NAME,
+    qa.potential_table AS table_name,
+    ts.TABLE_ROWS AS estimated_rows,
+    ts.size_mb,
+    qa.SUM_CREATED_TMP_DISK_TABLES AS disk_temps_created,
+    qa.SUM_NO_INDEX_USED AS no_index_count,
+    qa.COUNT_STAR AS query_executions,
+    LEFT(qa.DIGEST_TEXT, 150) AS query_sample,
+    CASE 
+        WHEN qa.DIGEST_TEXT LIKE '%WHERE%' 
+            THEN 'Analyze WHERE clause for index candidates'
+        WHEN qa.DIGEST_TEXT LIKE '%JOIN%ON%'
+            THEN 'Ensure JOIN columns are indexed'
+        WHEN qa.DIGEST_TEXT LIKE '%GROUP BY%'
+            THEN 'Create composite index on GROUP BY columns'
+        WHEN qa.DIGEST_TEXT LIKE '%ORDER BY%'
+            THEN 'Create index on ORDER BY columns'
+        ELSE 'Run EXPLAIN for detailed analysis'
+    END AS recommendation,
+    CONCAT(
+        '-- Suggested starting point:\n',
+        'EXPLAIN SELECT ... FROM ', qa.SCHEMA_NAME, '.', qa.potential_table, ' WHERE ...;\n',
+        '-- Then create appropriate index based on EXPLAIN output'
+    ) AS next_steps
+FROM query_analysis qa
+LEFT JOIN table_stats ts 
+    ON qa.SCHEMA_NAME = ts.TABLE_SCHEMA 
+    AND REPLACE(REPLACE(qa.potential_table, '`', ''), ';', '') = ts.TABLE_NAME
+WHERE qa.SUM_CREATED_TMP_DISK_TABLES > 10
+   OR (qa.SUM_NO_INDEX_USED > 0 AND qa.COUNT_STAR > 100)
+ORDER BY qa.SUM_CREATED_TMP_DISK_TABLES DESC, qa.COUNT_STAR DESC
+LIMIT 30;
+Configuration Optimization Calculator
+
+Script 39: Memory Configuration Optimizer
+
+
+
+-- Calculate optimal memory settings based on instance size and workload
+SELECT 
+    'Memory Analysis' AS category,
+    -- Get instance memory (approximation based on InnoDB buffer pool)
+    ROUND((SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+           WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024, 2) AS buffer_pool_gb,
+    -- Current temp settings
+    ROUND(@@tmp_table_size / 1024 / 1024, 2) AS current_tmp_table_mb,
+    ROUND(@@temptable_max_ram / 1024 / 1024, 2) AS current_temptable_max_ram_mb,
+    -- Calculate recommendations
+    CASE 
+        WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+              WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 32
+            THEN 128  -- Large instance: 128MB tmp_table_size
+        WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+              WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 16
+            THEN 64   -- Medium instance: 64MB
+        ELSE 32       -- Small instance: 32MB
+    END AS recommended_tmp_table_mb,
+    CASE 
+        WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+              WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 32
+            THEN 2048  -- Large instance: 2GB temptable_max_ram
+        WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+              WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 16
+            THEN 1536  -- Medium instance: 1.5GB
+        ELSE 1024      -- Small instance: 1GB
+    END AS recommended_temptable_max_ram_mb,
+    -- Calculate potential memory impact
+    ROUND((
+        CASE 
+            WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+                  WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 32
+                THEN 128 * @@max_connections
+            WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+                  WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 16
+                THEN 64 * @@max_connections
+            ELSE 32 * @@max_connections
+        END
+    ) / 1024, 2) AS theoretical_max_tmp_memory_gb,
+    @@max_connections AS max_connections,
+    CASE 
+        WHEN @@max_connections > 500
+            THEN 'WARNING: High connection count may require conservative tmp_table_size'
+        WHEN @@max_connections < 50
+            THEN 'INFO: Low connection count allows higher tmp_table_size'
+        ELSE 'OK: Moderate connection count'
+    END AS connection_assessment
+UNION ALL
+SELECT 
+    'Workload Analysis',
+    NULL,
+    NULL,
+    NULL,
+    ROUND(AVG(SUM_CREATED_TMP_DISK_TABLES / NULLIF(COUNT_STAR, 0)), 2),
+    ROUND(MAX(SUM_CREATED_TMP_DISK_TABLES / NULLIF(COUNT_STAR, 0)), 2),
+    NULL,
+    NULL,
+    CASE 
+        WHEN AVG(SUM_CREATED_TMP_DISK_TABLES / NULLIF(COUNT_STAR, 0)) > 1
+            THEN 'High disk temp usage - prioritize increasing tmp_table_size'
+        WHEN AVG(SUM_CREATED_TMP_DISK_TABLES / NULLIF(COUNT_STAR, 0)) BETWEEN 0.1 AND 1
+            THEN 'Moderate disk temp usage - current settings may be adequate'
+        ELSE 'Low disk temp usage - focus on query optimization instead'
+    END
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_CREATED_TMP_TABLES > 0;
+Script 40: Generate GCloud Commands for Optimal Configuration
+
+
+
+-- This generates the actual gcloud commands based on recommendations
+SELECT 
+    CONCAT(
+        '# Recommended configuration for instance:\n',
+        'gcloud sql instances patch YOUR_INSTANCE_NAME \\\n',
+        '  --database-flags="\\\n',
+        '    tmp_table_size=', recommended_tmp_table_size, ',\\\n',
+        '    max_heap_table_size=', recommended_tmp_table_size, ',\\\n',
+        '    temptable_max_ram=', recommended_temptable_max_ram, ',\\\n',
+        '    sort_buffer_size=', recommended_sort_buffer, ',\\\n',
+        '    join_buffer_size=', recommended_join_buffer, ',\\\n',
+        '    max_execution_time=', recommended_max_execution_time, '"\n\n',
+        '# Note: ', notes
+    ) AS gcloud_command
+FROM (
+    SELECT 
+        CASE 
+            WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+                  WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 32
+                THEN 134217728  -- 128MB in bytes
+            WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+                  WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 16
+                THEN 67108864   -- 64MB
+            ELSE 33554432       -- 32MB
+        END AS recommended_tmp_table_size,
+        CASE 
+            WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+                  WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 32
+                THEN 2147483648  -- 2GB
+            WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_variables 
+                  WHERE VARIABLE_NAME = 'innodb_buffer_pool_size') / 1024 / 1024 / 1024 > 16
+                THEN 1610612736  -- 1.5GB
+            ELSE 1073741824      -- 1GB
+        END AS recommended_temptable_max_ram,
+        4194304 AS recommended_sort_buffer,  -- 4MB
+        2097152 AS recommended_join_buffer,  -- 2MB
+        300000 AS recommended_max_execution_time,  -- 5 minutes
+        'This configuration requires instance restart. Test in staging first.' AS notes
+) AS config;
+GCP Cloud SQL Specific Considerations
+
+Cloud SQL API and Automation Scripts
+
+Script 41: Cloud SQL Instance Health Check
+
+
+
+#!/bin/bash
+# Cloud SQL comprehensive health check script
+INSTANCE_NAME="YOUR_INSTANCE_NAME"
+PROJECT_ID="YOUR_PROJECT_ID"
+echo "=== Cloud SQL Instance Health Check ==="
+echo "Instance: $INSTANCE_NAME"
+echo "Project: $PROJECT_ID"
+echo "Timestamp: $(date)"
+echo ""
+# 1. Instance configuration
+echo "--- Instance Configuration ---"
+gcloud sql instances describe $INSTANCE_NAME \
+  --project=$PROJECT_ID \
+  --format="table(
+    settings.tier,
+    settings.dataDiskSizeGb,
+    settings.dataDiskType,
+    settings.storageAutoResize,
+    settings.storageAutoResizeLimit,
+    settings.availabilityType
+  )"
+# 2. Current operations
+echo -e "\n--- Current Operations ---"
+gcloud sql operations list \
+  --instance=$INSTANCE_NAME \
+  --project=$PROJECT_ID \
+  --filter="status=RUNNING OR status=PENDING" \
+  --format="table(operationType,status,startTime,endTime)"
+# 3. Storage metrics (last 1 hour)
+echo -e "\n--- Storage Metrics (last hour) ---"
+gcloud monitoring time-series list \
+  --filter="metric.type=\"cloudsql.googleapis.com/database/disk/bytes_used\" 
+    AND resource.labels.database_id=\"$PROJECT_ID:$INSTANCE_NAME\"" \
+  --format="table(points[0].value.doubleValue.yesno(no='N/A'),points[0].interval.endTime)" \
+  --project=$PROJECT_ID
+# 4. Check for recent errors in logs
+echo -e "\n--- Recent Error Logs ---"
+gcloud logging read "resource.type=cloudsql_database 
+  AND resource.labels.database_id=\"$PROJECT_ID:$INSTANCE_NAME\"
+  AND severity>=ERROR
+  AND timestamp>=\\\"$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)\\\"" \
+  --project=$PROJECT_ID \
+  --limit=10 \
+  --format="table(timestamp,textPayload)"
+# 5. Check slow query logs
+echo -e "\n--- Recent Slow Queries ---"
+gcloud logging read "resource.type=cloudsql_database 
+  AND resource.labels.database_id=\"$PROJECT_ID:$INSTANCE_NAME\"
+  AND textPayload=~\"Tmp_disk_tables\"
+  AND timestamp>=\\\"$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)\\\"" \
+  --project=$PROJECT_ID \
+  --limit=5 \
+  --format="table(timestamp,textPayload)"
+echo -e "\n=== Health Check Complete ==="
+Script 42: Automated Temp Space Monitoring
+
+
+
+#!/bin/bash
+# Monitor temp tablespace usage and alert if threshold exceeded
+INSTANCE_NAME="YOUR_INSTANCE_NAME"
+CONNECTION_NAME="YOUR_CONNECTION_NAME"  # Format: project:region:instance
+THRESHOLD_PCT=70  # Alert if temp usage exceeds this percentage
+EMAIL_ALERT="your-email@example.com"
+# Connect and check temp space
+TEMP_USAGE=$(mysql -h /cloudsql/$CONNECTION_NAME -u root -p <<EOF
+SET SESSION sql_mode='';
+SELECT ROUND(
+  ((TOTAL_EXTENTS - FREE_EXTENTS) / TOTAL_EXTENTS * 100), 2
+) AS pct_used
+FROM INFORMATION_SCHEMA.FILES 
+WHERE TABLESPACE_NAME='innodb_temporary';
+EOF
+)
+# Parse result
+PCT_USED=$(echo "$TEMP_USAGE" | grep -oP '\d+\.\d+' | head -1)
+echo "Current temp tablespace usage: $PCT_USED%"
+# Check threshold
+if (( $(echo "$PCT_USED > $THRESHOLD_PCT" | bc -l) )); then
+    echo "WARNING: Temp tablespace usage exceeds threshold!"
+    # Get top offending queries
+    OFFENDERS=$(mysql -h /cloudsql/$CONNECTION_NAME -u root -p <<EOF
+SELECT CONCAT(
+  'Digest: ', LEFT(DIGEST_TEXT, 100), '\n',
+  'Disk Temps: ', SUM_CREATED_TMP_DISK_TABLES, '\n',
+  'Executions: ', COUNT_STAR
+) AS info
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_CREATED_TMP_DISK_TABLES > 0
+ORDER BY SUM_CREATED_TMP_DISK_TABLES DESC
+LIMIT 5;
+EOF
+    )
+    # Send alert (requires configured mail/sendmail)
+    echo -e "Subject: Cloud SQL Temp Space Alert - $INSTANCE_NAME\n\n\
+    Temp tablespace usage: $PCT_USED%\n\n\
+    Top offending queries:\n$OFFENDERS" | \
+    sendmail $EMAIL_ALERT
+    exit 1
+else
+    echo "Temp tablespace usage is within acceptable limits."
+    exit 0
+fi
+Cloud Monitoring Integration
+
+Script 43: Create Custom Metrics for Temp Usage
+
+
+
+#!/bin/bash
+# Create custom Cloud Monitoring metrics for temp tablespace
+PROJECT_ID="YOUR_PROJECT_ID"
+INSTANCE_NAME="YOUR_INSTANCE_NAME"
+# Create custom metric descriptor
+gcloud monitoring metric-descriptors create \
+  custom.googleapis.com/mysql/temp_tablespace_usage_pct \
+  --project=$PROJECT_ID \
+  --display-name="MySQL Temporary Tablespace Usage %" \
+  --description="Percentage of temporary tablespace in use" \
+  --metric-kind=GAUGE \
+  --value-type=DOUBLE \
+  --unit="%"
+# Create metric for disk temp tables rate
+gcloud monitoring metric-descriptors create \
+  custom.googleapis.com/mysql/disk_temp_tables_rate \
+  --project=$PROJECT_ID \
+  --display-name="MySQL Disk Temp Tables Creation Rate" \
+  --description="Rate of disk-based temporary table creation (per minute)" \
+  --metric-kind=GAUGE \
+  --value-type=INT64 \
+  --unit="tables/min"
+echo "Custom metrics created successfully"
+Script 44: Push Custom Metrics to Cloud Monitoring
+
+
+
+#!/usr/bin/env python3
+"""
+Push MySQL temp tablespace metrics to Cloud Monitoring
+Requires: google-cloud-monitoring, mysql-connector-python
+"""
+from google.cloud import monitoring_v3
+import mysql.connector
+import time
+from datetime import datetime
+PROJECT_ID = "YOUR_PROJECT_ID"
+INSTANCE_CONNECTION = "YOUR_CONNECTION_NAME"
+DB_USER = "root"
+DB_PASS = "YOUR_PASSWORD"
+def get_temp_usage(cursor):
+    """Get temporary tablespace usage percentage"""
+    query = """
+    SELECT ROUND(
+        ((TOTAL_EXTENTS - FREE_EXTENTS) / TOTAL_EXTENTS * 100), 2
+    ) AS pct_used
+    FROM INFORMATION_SCHEMA.FILES 
+    WHERE TABLESPACE_NAME='innodb_temporary'
+    """
+    cursor.execute(query)
+    result = cursor.fetchone()
+    return float(result[0]) if result else 0.0
+def get_disk_temp_rate(cursor):
+    """Calculate disk temp tables creation rate"""
+    query = "SHOW GLOBAL STATUS LIKE 'Created_tmp_disk_tables'"
+    cursor.execute(query)
+    result = cursor.fetchone()
+    return int(result[1]) if result else 0
+def write_metric(client, project_name, metric_type, value):
+    """Write time series data to Cloud Monitoring"""
+    series = monitoring_v3.TimeSeries()
+    series.metric.type = f"custom.googleapis.com/mysql/{metric_type}"
+    series.resource.type = "global"
+    now = time.time()
+    seconds = int(now)
+    nanos = int((now - seconds) * 10 ** 9)
+    interval = monitoring_v3.TimeInterval(
+        {"end_time": {"seconds": seconds, "nanos": nanos}}
+    )
+    point = monitoring_v3.Point(
+        {"interval": interval, "value": {"double_value": value}}
+    )
+    series.points = [point]
+    client.create_time_series(name=project_name, time_series=[series])
+def main():
+    # Connect to MySQL
+    conn = mysql.connector.connect(
+        unix_socket=f"/cloudsql/{INSTANCE_CONNECTION}",
+        user=DB_USER,
+        password=DB_PASS
+    )
+    cursor = conn.cursor()
+    # Setup Cloud Monitoring client
+    client = monitoring_v3.MetricServiceClient()
+    project_name = f"projects/{PROJECT_ID}"
+    # Store initial value for rate calculation
+    prev_disk_temps = get_disk_temp_rate(cursor)
+    prev_time = time.time()
+    try:
+        while True:
+            # Get metrics
+            temp_usage = get_temp_usage(cursor)
+            current_disk_temps = get_disk_temp_rate(cursor)
+            current_time = time.time()
+            # Calculate rate (tables per minute)
+            time_diff = (current_time - prev_time) / 60  # in minutes
+            disk_temp_rate = (current_disk_temps - prev_disk_temps) / time_diff if time_diff > 0 else 0
+            # Write to Cloud Monitoring
+            write_metric(client, project_name, "temp_tablespace_usage_pct", temp_usage)
+            write_metric(client, project_name, "disk_temp_tables_rate", disk_temp_rate)
+            print(f"[{datetime.now()}] Temp Usage: {temp_usage}%, Disk Temp Rate: {disk_temp_rate:.2f}/min")
+            # Update previous values
+            prev_disk_temps = current_disk_temps
+            prev_time = current_time
+            # Wait 60 seconds before next measurement
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\nMonitoring stopped")
+    finally:
+        cursor.close()
+        conn.close()
+if __name__ == "__main__":
+    main()
+Cloud SQL Alerting Policies
+
+Script 45: Create Alert Policy via API
+
+
+
+#!/bin/bash
+# Create Cloud Monitoring alert policy for temp tablespace
+PROJECT_ID="YOUR_PROJECT_ID"
+NOTIFICATION_CHANNEL="YOUR_CHANNEL_ID"  # Get from Cloud Console
+cat > alert-policy.json <<EOF
+{
+  "displayName": "MySQL Temp Tablespace Usage High",
+  "documentation": {
+    "content": "Temporary tablespace usage has exceeded 70%. This may indicate queries creating excessive temporary tables. Investigate using the MySQL temp tablespace playbook.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "Temp tablespace usage > 70%",
+      "conditionThreshold": {
+        "filter": "metric.type=\"custom.googleapis.com/mysql/temp_tablespace_usage_pct\" resource.type=\"global\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 70,
+        "duration": "300s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_MEAN"
+          }
+        ]
+      }
+    }
+  ],
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/$PROJECT_ID/notificationChannels/$NOTIFICATION_CHANNEL"
+  ],
+  "alertStrategy": {
+    "autoClose": "1800s"
+  }
+}
+EOF
+# Create the alert policy
+gcloud alpha monitoring policies create --policy-from-file=alert-policy.json --project=$PROJECT_ID
+echo "Alert policy created successfully"
+Monitoring and Alerting Strategy {#monitoring-alerting}
+
+Comprehensive Monitoring Dashboard
+
+Script 46: Create Custom Monitoring Dashboard
+
+
+
+{
+  "displayName": "MySQL Temporary Tablespace Monitoring",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Temp Tablespace Usage %",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"custom.googleapis.com/mysql/temp_tablespace_usage_pct\" resource.type=\"global\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MEAN"
+                    }
+                  }
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ],
+            "yAxis": {
+              "label": "Usage %",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Disk Temp Tables Creation Rate",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"custom.googleapis.com/mysql/disk_temp_tables_rate\" resource.type=\"global\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MEAN"
+                    }
+                  }
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "yPos": 4,
+        "width": 12,
+        "height": 4,
+        "widget": {
+          "title": "Storage Usage",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"cloudsql.googleapis.com/database/disk/bytes_used\" resource.type=\"cloudsql_database\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MEAN"
+                    }
+                  }
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+Performance Schema Monitoring Scripts
+
+Script 47: Real-Time Temp Usage Monitor (Shell)
+
+
+
+#!/bin/bash
+# Real-time monitoring of temp tablespace usage
+# Runs in terminal, updates every 5 seconds
+CONNECTION_NAME="YOUR_CONNECTION_NAME"
+REFRESH_INTERVAL=5
+clear
+while true; do
+    tput cup 0 0  # Move cursor to top-left
+    echo "=== MySQL Temporary Tablespace Monitor ==="
+    echo "Timestamp: $(date)"
+    echo "Refresh: ${REFRESH_INTERVAL}s | Press Ctrl+C to exit"
+    echo ""
+    mysql -h /cloudsql/$CONNECTION_NAME -u root -p <<EOF
+-- Temp tablespace usage
+SELECT 
+    'Temp Tablespace' AS metric,
+    CONCAT(ROUND((TOTAL_EXTENTS - FREE_EXTENTS) * @@innodb_page_size / 1024 / 1024, 2), ' MB') AS used,
+    CONCAT(ROUND(TOTAL_EXTENTS * @@innodb_page_size / 1024 / 1024, 2), ' MB') AS total,
+    CONCAT(ROUND(((TOTAL_EXTENTS - FREE_EXTENTS) / TOTAL_EXTENTS * 100), 2), '%') AS pct_used
+FROM INFORMATION_SCHEMA.FILES 
+WHERE TABLESPACE_NAME='innodb_temporary'
+UNION ALL
+-- Temp table statistics
+SELECT 
+    'Disk Temp Tables',
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Created_tmp_disk_tables'),
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Created_tmp_tables'),
+    CONCAT(ROUND((
+        (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Created_tmp_disk_tables') /
+        NULLIF((SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Created_tmp_tables'), 0)
+    ) * 100, 2), '%');
+-- Active sessions using temp
+SELECT '\n--- Active Temp Operations ---' AS '';
+SELECT 
+    ID,
+    USER,
+    LEFT(HOST, 20) AS host,
+    TIME AS duration_sec,
+    LEFT(STATE, 30) AS state,
+    LEFT(INFO, 80) AS query
+FROM INFORMATION_SCHEMA.PROCESSLIST
+WHERE STATE LIKE '%tmp%' OR STATE LIKE '%Sorting%'
+ORDER BY TIME DESC
+LIMIT 5;
+-- Top temp table users
+SELECT '\n--- Top 5 Query Patterns by Disk Temp Usage ---' AS '';
+SELECT 
+    COUNT_STAR AS execs,
+    SUM_CREATED_TMP_DISK_TABLES AS disk_temps,
+    ROUND(AVG_TIMER_WAIT/1000000000000, 2) AS avg_sec,
+    LEFT(DIGEST_TEXT, 100) AS query
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_CREATED_TMP_DISK_TABLES > 0
+ORDER BY SUM_CREATED_TMP_DISK_TABLES DESC
+LIMIT 5;
+EOF
+    sleep $REFRESH_INTERVAL
+done
+Script 48: Temp Usage Trend Analysis
+
+
+
+-- Historical trend analysis of temp table usage
+-- Run this daily to track patterns
+CREATE TABLE IF NOT EXISTS temp_usage_history (
+    measurement_time DATETIME NOT NULL,
+    tmp_tables_total BIGINT,
+    tmp_disk_tables_total BIGINT,
+    disk_temp_pct DECIMAL(5,2),
+    ibtmp1_size_mb DECIMAL(10,2),
+    ibtmp1_used_mb DECIMAL(10,2),
+    top_query_digest VARCHAR(64),
+    top_query_disk_temps BIGINT,
+    PRIMARY KEY (measurement_time)
+) ENGINE=InnoDB;
+-- Insert current snapshot
+INSERT INTO temp_usage_history
+SELECT 
+    NOW() AS measurement_time,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+     WHERE VARIABLE_NAME='Created_tmp_tables') AS tmp_tables_total,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+     WHERE VARIABLE_NAME='Created_tmp_disk_tables') AS tmp_disk_tables_total,
+    ROUND((
+        (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+         WHERE VARIABLE_NAME='Created_tmp_disk_tables') /
+        NULLIF((SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+                WHERE VARIABLE_NAME='Created_tmp_tables'), 0)
+    ) * 100, 2) AS disk_temp_pct,
+    (SELECT ROUND(TOTAL_EXTENTS * @@innodb_page_size / 1024 / 1024, 2)
+     FROM INFORMATION_SCHEMA.FILES 
+     WHERE TABLESPACE_NAME='innodb_temporary') AS ibtmp1_size_mb,
+    (SELECT ROUND((TOTAL_EXTENTS - FREE_EXTENTS) * @@innodb_page_size / 1024 / 1024, 2)
+     FROM INFORMATION_SCHEMA.FILES 
+     WHERE TABLESPACE_NAME='innodb_temporary') AS ibtmp1_used_mb,
+    (SELECT DIGEST FROM performance_schema.events_statements_summary_by_digest 
+     WHERE SUM_CREATED_TMP_DISK_TABLES > 0 
+     ORDER BY SUM_CREATED_TMP_DISK_TABLES DESC LIMIT 1) AS top_query_digest,
+    (SELECT SUM_CREATED_TMP_DISK_TABLES FROM performance_schema.events_statements_summary_by_digest 
+     WHERE SUM_CREATED_TMP_DISK_TABLES > 0 
+     ORDER BY SUM_CREATED_TMP_DISK_TABLES DESC LIMIT 1) AS top_query_disk_temps;
+-- View trends (last 7 days)
+SELECT 
+    DATE(measurement_time) AS date,
+    MAX(disk_temp_pct) AS max_disk_temp_pct,
+    AVG(disk_temp_pct) AS avg_disk_temp_pct,
+    MAX(ibtmp1_size_mb) AS max_ibtmp1_size_mb,
+    MAX(ibtmp1_used_mb) AS max_ibtmp1_used_mb,
+    COUNT(*) AS measurements
+FROM temp_usage_history
+WHERE measurement_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+GROUP BY DATE(measurement_time)
+ORDER BY date DESC;
+-- Identify concerning trends
+SELECT 
+    'TREND ANALYSIS' AS analysis_type,
+    CASE 
+        WHEN (SELECT MAX(disk_temp_pct) FROM temp_usage_history 
+              WHERE measurement_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)) > 50
+        THEN 'WARNING: High disk temp percentage detected'
+        WHEN (SELECT MAX(ibtmp1_size_mb) FROM temp_usage_history 
+              WHERE measurement_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)) > 
+             (SELECT AVG(ibtmp1_size_mb) FROM temp_usage_history 
+              WHERE measurement_time >= DATE_SUB(NOW(), INTERVAL 30 DAY)) * 1.5
+        THEN 'WARNING: ibtmp1 size increased significantly'
+        ELSE 'OK: Temp usage within expected parameters'
+    END AS assessment;
+Prevention and Long-Term Solutions
+
+Automated Query Review System
+
+Script 49: Daily Query Performance Report
+
+
+
+-- Generate daily performance report
+-- Schedule this to run daily and email results
+DELIMITER //
+CREATE PROCEDURE generate_daily_temp_report()
+BEGIN
+    DECLARE report_date DATE;
+    SET report_date = CURDATE();
+    -- Create temporary reporting table
+    CREATE TEMPORARY TABLE IF NOT EXISTS daily_report (
+        section VARCHAR(100),
+        metric VARCHAR(100),
+        value VARCHAR(500),
+        severity ENUM('INFO', 'WARNING', 'CRITICAL')
+    );
+    -- Section 1: Overall Statistics
+    INSERT INTO daily_report
+    SELECT 
+        'Overall Statistics' AS section,
+        'Total Temp Tables Created' AS metric,
+        (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+         WHERE VARIABLE_NAME='Created_tmp_tables') AS value,
+        'INFO' AS severity
+    UNION ALL
+    SELECT 
+        'Overall Statistics',
+        'Disk Temp Tables Created',
+        (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+         WHERE VARIABLE_NAME='Created_tmp_disk_tables'),
+        CASE 
+            WHEN (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+                  WHERE VARIABLE_NAME='Created_tmp_disk_tables') > 1000000
+            THEN 'WARNING'
+            ELSE 'INFO'
+        END
+    UNION ALL
+    SELECT 
+        'Overall Statistics',
+        'Disk Temp Percentage',
+        CONCAT(ROUND((
+            (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+             WHERE VARIABLE_NAME='Created_tmp_disk_tables') /
+            NULLIF((SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+                    WHERE VARIABLE_NAME='Created_tmp_tables'), 0)
+        ) * 100, 2), '%'),
+        CASE 
+            WHEN ROUND((
+                (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+                 WHERE VARIABLE_NAME='Created_tmp_disk_tables') /
+                NULLIF((SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+                        WHERE VARIABLE_NAME='Created_tmp_tables'), 0)
+            ) * 100, 2) > 50
+            THEN 'CRITICAL'
+            WHEN ROUND((
+                (SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+                 WHERE VARIABLE_NAME='Created_tmp_disk_tables') /
+                NULLIF((SELECT VARIABLE_VALUE FROM performance_schema.global_status 
+                        WHERE VARIABLE_NAME='Created_tmp_tables'), 0)
+            ) * 100, 2) > 20
+            THEN 'WARNING'
+            ELSE 'INFO'
+        END;
+    -- Section 2: Top Offending Queries
+    INSERT INTO daily_report
+    SELECT 
+        'Top Offenders',
+        CONCAT('Query #', @rownum := @rownum + 1),
+        CONCAT(
+            'Digest: ', LEFT(DIGEST, 16), ' | ',
+            'Disk Temps: ', SUM_CREATED_TMP_DISK_TABLES, ' | ',
+            'Executions: ', COUNT_STAR, ' | ',
+            'Avg Time: ', ROUND(AVG_TIMER_WAIT/1000000000000, 2), 's'
+        ),
+        CASE 
+            WHEN SUM_CREATED_TMP_DISK_TABLES > 10000 THEN 'CRITICAL'
+            WHEN SUM_CREATED_TMP_DISK_TABLES > 1000 THEN 'WARNING'
+            ELSE 'INFO'
+        END
+    FROM performance_schema.events_statements_summary_by_digest, (SELECT @rownum := 0) r
+    WHERE SUM_CREATED_TMP_DISK_TABLES > 0
+    ORDER BY SUM_CREATED_TMP_DISK_TABLES DESC
+    LIMIT 10;
+    -- Section 3: Resource Usage
+    INSERT INTO daily_report
+    SELECT 
+        'Resource Usage',
+        'Temp Tablespace Size',
+        CONCAT(
+            ROUND(TOTAL_EXTENTS * @@innodb_page_size / 1024 / 1024, 2), ' MB total, ',
+            ROUND((TOTAL_EXTENTS - FREE_EXTENTS) * @@innodb_page_size / 1024 / 1024, 2), ' MB used (',
+            ROUND(((TOTAL_EXTENTS - FREE_EXTENTS) / TOTAL_EXTENTS * 100), 2), '%)'
+        ),
+        CASE 
+            WHEN ROUND(((TOTAL_EXTENTS - FREE_EXTENTS) / TOTAL_EXTENTS * 100), 2) > 80
+            THEN 'CRITICAL'
+            WHEN ROUND(((TOTAL_EXTENTS - FREE_EXTENTS) / TOTAL_EXTENTS * 100), 2) > 60
+            THEN 'WARNING'
+            ELSE 'INFO'
+        END
+    FROM INFORMATION_SCHEMA.FILES 
+    WHERE TABLESPACE_NAME='innodb_temporary';
+    -- Section 4: Recommendations
+    INSERT INTO daily_report
+    SELECT 
+        'Recommendations',
+        'Action Required',
+        CASE 
+            WHEN COUNT(*) > 0 THEN 'Review and optimize queries with high disk temp usage'
+            ELSE 'No immediate action required'
+        END,
+        CASE 
+            WHEN COUNT(*) > 0 THEN 'WARNING'
+            ELSE 'INFO'
+        END
+    FROM performance_schema.events_statements_summary_by_digest
+    WHERE SUM_CREATED_TMP_DISK_TABLES > 1000;
+    -- Output the report
+    SELECT 
+        section,
+        metric,
+        value,
+        severity
+    FROM daily_report
+    ORDER BY 
+        CASE section
+            WHEN 'Overall Statistics' THEN 1
+            WHEN 'Top Offenders' THEN 2
+            WHEN 'Resource Usage' THEN 3
+            WHEN 'Recommendations' THEN 4
+        END,
+        CASE severity
+            WHEN 'CRITICAL' THEN 1
+            WHEN 'WARNING' THEN 2
+            WHEN 'INFO' THEN 3
+        END;
+    -- Cleanup
+    DROP TEMPORARY TABLE IF EXISTS daily_report;
+END//
+DELIMITER ;
+-- Execute the report
+CALL generate_daily_temp_report();
+Capacity Planning Tools
+
+Script 50: Capacity Forecast Model
+
+
+
+-- Predict future temp space needs based on historical growth
+WITH daily_stats AS (
+    SELECT 
+        DATE(measurement_time) AS date,
+        AVG(disk_temp_pct) AS avg_disk_pct,
+        MAX(ibtmp1_size_mb) AS max_size_mb,
+        AVG(ibtmp1_used_mb) AS avg_used_mb
+    FROM temp_usage_history
+    WHERE measurement_time >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+    GROUP BY DATE(measurement_time)
+),
+growth_rate AS (
+    SELECT 
+        AVG((max_size_mb - LAG(max_size_mb) OVER (ORDER BY date)) / NULLIF(LAG(max_size_mb) OVER (ORDER BY date), 0) * 100) AS daily_growth_pct,
+        STDDEV((max_size_mb - LAG(max_size_mb) OVER (ORDER BY date)) / NULLIF(LAG(max_size_mb) OVER (ORDER BY date), 0) * 100) AS growth_volatility
+    FROM daily_stats
+)
+SELECT 
+    'Capacity Forecast' AS analysis,
+    CONCAT(ROUND(daily_growth_pct, 2), '%') AS avg_daily_growth,
+    CONCAT(ROUND(growth_volatility, 2), '%') AS growth_volatility,
+    CONCAT(
+        'Projected size in 30 days: ',
+        ROUND((SELECT MAX(max_size_mb) FROM daily_stats) * POWER(1 + (daily_growth_pct/100), 30), 2),
+        ' MB'
+    ) AS forecast_30_days,
+    CONCAT(
+        'Projected size in 90 days: ',
+        ROUND((SELECT MAX(max_size_mb) FROM daily_stats) * POWER(1 + (daily_growth_pct/100), 90), 2),
+        ' MB'
+    ) AS forecast_90_days,
+    CASE 
+        WHEN daily_growth_pct > 5 THEN 'CRITICAL: Investigate immediate optimization opportunities'
+        WHEN daily_growth_pct > 2 THEN 'WARNING: Monitor closely and plan optimizations'
+        ELSE 'INFO: Growth rate is manageable'
+    END AS recommendation
+FROM growth_rate;
+ 
